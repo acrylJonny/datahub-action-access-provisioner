@@ -1,0 +1,89 @@
+[build-system]
+requires = ["setuptools>=45", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "datahub-action-access-provisioner"
+version = "0.1.0"
+description = "DataHub Action to provision Snowflake access and send email notifications on workflow approval"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+authors = [
+    {name = "Jonny Dixon"}
+]
+dependencies = [
+    "snowflake-connector-python>=3.0.0,<5.0.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["action_access_provisioner*"]
+exclude = ["tests*"]
+
+[project.optional-dependencies]
+dev = [
+    "acryl-datahub-actions>=0.0.9",
+    "acryl-datahub>=0.8.34",
+    "pydantic>=2.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0",
+    "pytest-mock>=3.10.0",
+    "types-PyYAML",
+    "freezegun>=1.2.0",
+]
+
+[project.entry-points."datahub_actions.action.plugins"]
+action-access-provisioner = "action_access_provisioner.access_provisioner_action:AccessProvisionerAction"
+
+[tool.ruff]
+line-length = 100
+target-version = "py39"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["action_access_provisioner"]
+
+[tool.mypy]
+python_version = "3.9"
+warn_return_any = true
+warn_unused_configs = true
+disallow_untyped_defs = false
+disallow_incomplete_defs = false
+check_untyped_defs = true
+no_implicit_optional = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_no_return = true
+strict_optional = true
+
+[[tool.mypy.overrides]]
+module = [
+    "datahub.*",
+    "datahub_actions.*",
+    "snowflake.*",
+    "_pytest.*",
+    "pytest.*",
+    "freezegun.*",
+]
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+markers = [
+    "integration: marks tests as integration tests (deselect with '-m \"not integration\"')",
+]
+addopts = "-m 'not integration'"

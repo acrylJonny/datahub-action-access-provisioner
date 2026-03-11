@@ -1,0 +1,85 @@
+# Example configuration for the Access Provisioner action
+#
+# Author: Jonny Dixon
+#
+# This action listens for DataHub workflow access-request approvals and:
+#   1. Executes the corresponding Snowflake GRANT statements
+#   2. Sends a confirmation email to the requestor via Gmail
+#   3. Monitors pending requests and sends SLA reminder / escalation emails
+#   4. Auto-revokes Snowflake access when the declared access duration expires
+
+name: access-provisioner
+
+source:
+  type: "datahub-cloud"
+  config:
+    kill_after_idle_timeout: false
+
+action:
+  type: "action-access-provisioner"
+  config:
+    # ----------------------------------------------------------------
+    # Snowflake connection (executes GRANT / REVOKE statements)
+    # ----------------------------------------------------------------
+    snowflake_connection:
+      account_id: "xy12345"              # e.g. xy12345.us-east-1
+      username: "datahub_provisioner"
+      password: "${SNOWFLAKE_PASSWORD}"
+      warehouse: "COMPUTE_WH"
+      role: "SYSADMIN"                   # Must have GRANT privilege
+      authentication_type: "DEFAULT_AUTHENTICATOR"
+      # For key-pair auth, use:
+      # authentication_type: "KEY_PAIR_AUTHENTICATOR"
+      # private_key_path: "/secrets/snowflake_key.pem"
+      # private_key_password: "${SNOWFLAKE_KEY_PASSWORD}"
+
+    # ----------------------------------------------------------------
+    # Gmail SMTP (outbound email notifications)
+    # ----------------------------------------------------------------
+    smtp:
+      host: "smtp.gmail.com"
+      port: 587
+      username: "datahub-noreply@yourdomain.com"
+      password: "${GMAIL_APP_PASSWORD}"   # Google App Password
+      from_address: "DataHub Access Bot <datahub-noreply@yourdomain.com>"
+      use_tls: true
+
+    # ----------------------------------------------------------------
+    # SLA monitoring
+    # ----------------------------------------------------------------
+    sla:
+      warning_after_hours: 24            # Send reminder after 24 h
+      escalation_after_hours: 72         # Escalate after 72 h
+      escalation_recipients:             # CC'd on escalation emails
+        - "data-governance@yourdomain.com"
+      check_interval_seconds: 3600       # Poll every hour
+
+    # ----------------------------------------------------------------
+    # Access expiry / auto-revocation
+    # ----------------------------------------------------------------
+    expiry:
+      enabled: true
+      check_interval_seconds: 3600
+      revocation_notification: true      # Email requestor on revocation
+
+    # ----------------------------------------------------------------
+    # Snowflake provisioning options
+    # ----------------------------------------------------------------
+    provisioning:
+      default_warehouse: "COMPUTE_WH"    # Granted alongside database access
+      dry_run: false                     # Set true to test without executing
+
+    # ----------------------------------------------------------------
+    # Workflow form field IDs
+    # These must match the `id` values you defined in your DataHub workflow form.
+    # ----------------------------------------------------------------
+    field_snowflake_database: "snowflake_database"
+    field_snowflake_schema: "snowflake_schema"
+    field_snowflake_role: "snowflake_role"
+    field_access_duration_days: "access_duration_days"
+    field_requestor_email: "requestor_email"
+    field_justification: "justification"
+
+datahub:
+  server: "https://your-datahub-instance.acryl.io"
+  token: "${DATAHUB_TOKEN}"
