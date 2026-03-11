@@ -43,8 +43,8 @@ Background threads (always running):
 ## Prerequisites
 
 - Python 3.9+
-- `acryl-datahub-actions >= 0.0.9`
-- `acryl-datahub >= 0.8.34`
+- `acryl-datahub-actions >= 1.0.0`
+- `acryl-datahub >= 1.0.0`
 - A Snowflake account — the configured user/role must have `GRANT OPTION` on
   the databases/schemas you intend to provision.
 - A Gmail account with an [App Password](https://myaccount.google.com/apppasswords)

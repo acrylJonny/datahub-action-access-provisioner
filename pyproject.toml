@@ -23,8 +23,8 @@ exclude = ["tests*"]
 
 [project.optional-dependencies]
 dev = [
-    "acryl-datahub-actions>=0.0.9",
-    "acryl-datahub>=0.8.34",
+    "acryl-datahub-actions>=1.0.0",
+    "acryl-datahub>=1.0.0",
     "pydantic>=2.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
