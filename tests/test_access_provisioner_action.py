@@ -13,6 +13,22 @@ from action_access_provisioner.models import (
 )
 
 # ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_mcl_event(entity_type: str, aspect_name: str, entity_urn: str):
+    from datahub_actions.event.event_envelope import EventEnvelope
+
+    mcl = MagicMock()
+    mcl.entityType = entity_type
+    mcl.aspectName = aspect_name
+    mcl.entityUrn = entity_urn
+
+    return EventEnvelope(event_type="MetadataChangeLogEvent_v1", event=mcl, meta={})
+
+
+# ---------------------------------------------------------------------------
 # Fixtures
 # ---------------------------------------------------------------------------
 
@@ -34,18 +50,13 @@ def base_config_dict():
             "warehouse": "TEST_WH",
             "authentication_type": "DEFAULT_AUTHENTICATOR",
         },
+        "state": {
+            "database": "TEST_DB",
+            "schema": "AP_STATE",
+        },
         "smtp": {
             "username": "sender@gmail.com",
             "password": "app-password",
-        },
-        "sla": {
-            "warning_after_hours": 24,
-            "escalation_after_hours": 72,
-            "check_interval_seconds": 3600,
-        },
-        "expiry": {
-            "enabled": True,
-            "check_interval_seconds": 3600,
         },
         "provisioning": {
             "dry_run": True,
@@ -54,7 +65,7 @@ def base_config_dict():
 
 
 @pytest.fixture
-def approved_access_request():
+def approved_request():
     return AccessRequest(
         urn="urn:li:actionRequest:approved-001",
         status="COMPLETED",
@@ -71,18 +82,18 @@ def approved_access_request():
             snowflake_role="ANALYST_ROLE",
             access_duration_days=30,
             requestor_email="alice@example.com",
-            justification="Needed for quarterly analysis",
+            justification="Q3 analysis",
         ),
     )
 
 
 @pytest.fixture
-def denied_access_request():
+def denied_request():
     return AccessRequest(
         urn="urn:li:actionRequest:denied-001",
         status="COMPLETED",
         result="DENIED",
-        note="Access policy does not permit this",
+        note="Policy does not permit this",
         request_type="WORKFLOW_FORM_REQUEST",
         resource="urn:li:dataset:(urn:li:dataPlatform:snowflake,PROD.HR.EMPLOYEES,PROD)",
         requestor_urn="urn:li:corpuser:bob",
@@ -92,332 +103,376 @@ def denied_access_request():
             snowflake_database="PROD",
             snowflake_schema="HR",
             snowflake_role="HR_READ_ROLE",
-            access_duration_days=7,
             requestor_email="bob@example.com",
-            justification="Investigating payroll discrepancy",
         ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Factory / lifecycle tests
+# Factory / catchup
 # ---------------------------------------------------------------------------
 
 
-def test_create_starts_background_threads(base_config_dict, mock_pipeline_context):
-    with patch(
-        "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-    ) as mock_start:
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+def _create_action(base_config_dict, mock_pipeline_context, catchup_patch=True):
+    """Helper to create action with catchup patched out by default."""
+    from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
 
+    if catchup_patch:
+        with patch.object(AccessProvisionerAction, "_startup_catchup"):
+            action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
+        return action
+    return AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
+
+
+def test_create_calls_startup_catchup(base_config_dict, mock_pipeline_context):
+    from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+
+    with patch.object(AccessProvisionerAction, "_startup_catchup") as mock_catchup:
         action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        mock_start.assert_called_once()
+        mock_catchup.assert_called_once()
         action.close()
 
 
-def test_close_sets_stop_event(base_config_dict, mock_pipeline_context):
-    with patch(
-        "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
+def test_catchup_approved_skips_already_provisioned(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+
+    with patch.object(AccessProvisionerAction, "_startup_catchup"):
+        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(
+            "action_access_provisioner.access_provisioner_action.fetch_all_approved_requests",
+            return_value=[approved_request],
+        ),
+        patch(
+            "action_access_provisioner.access_provisioner_action.is_already_provisioned",
+            return_value=True,
+        ),
+        patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch("action_access_provisioner.access_provisioner_action.ensure_state_tables"),
+        patch.object(action, "_provision") as mock_provision,
     ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+        action._catchup_approved_requests()
+        mock_provision.assert_not_called()
 
+    action.close()
+
+
+def test_catchup_approved_provisions_new_requests(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+
+    with patch.object(AccessProvisionerAction, "_startup_catchup"):
         action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        assert not action._stop_event.is_set()
-        action.close()
-        assert action._stop_event.is_set()
+
+    with (
+        patch(
+            "action_access_provisioner.access_provisioner_action.fetch_all_approved_requests",
+            return_value=[approved_request],
+        ),
+        patch(
+            "action_access_provisioner.access_provisioner_action.is_already_provisioned",
+            return_value=False,
+        ),
+        patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch.object(action, "_provision") as mock_provision,
+    ):
+        action._catchup_approved_requests()
+        mock_provision.assert_called_once_with(approved_request)
+
+    action.close()
 
 
 # ---------------------------------------------------------------------------
-# Event routing tests
+# Live event routing
 # ---------------------------------------------------------------------------
-
-
-def _make_mcl_event(entity_type: str, aspect_name: str, entity_urn: str):
-    """Build a minimal fake MetadataChangeLogEvent envelope."""
-    from datahub_actions.event.event_envelope import EventEnvelope
-
-    mcl = MagicMock()
-    mcl.entityType = entity_type
-    mcl.aspectName = aspect_name
-    mcl.entityUrn = entity_urn
-
-    return EventEnvelope(
-        event_type="MetadataChangeLogEvent_v1",
-        event=mcl,
-        meta={},
-    )
 
 
 def test_act_ignores_non_mcl_events(base_config_dict, mock_pipeline_context):
-    with patch(
-        "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-    ):
-        from datahub_actions.event.event_envelope import EventEnvelope
+    from datahub_actions.event.event_envelope import EventEnvelope
 
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    action._handle_status_change = MagicMock()
 
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._handle_status_change = MagicMock()
+    other = EventEnvelope(event_type="EntityChangeEvent_v1", event=MagicMock(), meta={})
+    action.act(other)
 
-        other_event = EventEnvelope(event_type="EntityChangeEvent_v1", event=MagicMock(), meta={})
-        action.act(other_event)
-
-        action._handle_status_change.assert_not_called()
-        action.close()
+    action._handle_status_change.assert_not_called()
+    action.close()
 
 
 def test_act_ignores_wrong_aspect(base_config_dict, mock_pipeline_context):
-    with patch(
-        "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-    ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    action._handle_status_change = MagicMock()
 
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._handle_status_change = MagicMock()
+    env = _make_mcl_event("actionRequest", "actionRequestInfo", "urn:li:actionRequest:1")
+    action.act(env)
 
-        env = _make_mcl_event("actionRequest", "actionRequestInfo", "urn:li:actionRequest:1")
-        action.act(env)
-
-        action._handle_status_change.assert_not_called()
-        action.close()
+    action._handle_status_change.assert_not_called()
+    action.close()
 
 
-def test_act_triggers_handle_on_correct_aspect(base_config_dict, mock_pipeline_context):
-    with patch(
-        "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-    ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+def test_act_triggers_handle_on_status_change(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    action._handle_status_change = MagicMock()
 
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._handle_status_change = MagicMock()
+    env = _make_mcl_event("actionRequest", "actionRequestStatus", "urn:li:actionRequest:001")
+    action.act(env)
 
-        env = _make_mcl_event(
-            "actionRequest", "actionRequestStatus", "urn:li:actionRequest:approved-001"
-        )
-        action.act(env)
-
-        action._handle_status_change.assert_called_once_with("urn:li:actionRequest:approved-001")
-        action.close()
+    action._handle_status_change.assert_called_once_with("urn:li:actionRequest:001")
+    action.close()
 
 
 # ---------------------------------------------------------------------------
-# Provisioning tests
+# _handle_status_change — idempotency guard
 # ---------------------------------------------------------------------------
 
 
-def test_provision_executes_grants_and_sends_email(
-    base_config_dict, mock_pipeline_context, approved_access_request
+def test_handle_status_change_skips_duplicate_approval(
+    base_config_dict, mock_pipeline_context, approved_request
 ):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
     with (
         patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
+            "action_access_provisioner.access_provisioner_action.fetch_action_request",
+            return_value=approved_request,
+        ),
+        patch(
+            "action_access_provisioner.access_provisioner_action.is_already_provisioned",
+            return_value=True,
         ),
         patch("action_access_provisioner.access_provisioner_action.get_connection"),
-        patch(
-            "action_access_provisioner.access_provisioner_action.provision_access"
-        ) as mock_provision,
-        patch(
-            "action_access_provisioner.access_provisioner_action.send_approval_notification"
-        ) as mock_email,
+        patch.object(action, "_provision") as mock_provision,
     ):
-        mock_provision.return_value = ["GRANT USAGE ON DATABASE PROD TO ROLE ANALYST_ROLE"]
-
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._provision(approved_access_request)
-
-        mock_provision.assert_called_once()
-        mock_email.assert_called_once()
-
-        # Grant should be recorded
-        assert "urn:li:actionRequest:approved-001" in action._active_grants
-        grant = action._active_grants["urn:li:actionRequest:approved-001"]
-        assert grant.snowflake_role == "ANALYST_ROLE"
-        assert grant.expires_at_ms is not None
-
-        action.close()
-
-
-def test_provision_skips_when_missing_role(
-    base_config_dict, mock_pipeline_context, approved_access_request
-):
-    approved_access_request.form_fields.snowflake_role = None
-
-    with (
-        patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-        ),
-        patch(
-            "action_access_provisioner.access_provisioner_action.provision_access"
-        ) as mock_provision,
-    ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._provision(approved_access_request)
-
+        action._handle_status_change(approved_request.urn)
         mock_provision.assert_not_called()
-        action.close()
+
+    action.close()
 
 
-def test_handle_status_change_denied(
-    base_config_dict, mock_pipeline_context, denied_access_request
+def test_handle_status_change_provisions_new_approval(
+    base_config_dict, mock_pipeline_context, approved_request
 ):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
     with (
         patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
+            "action_access_provisioner.access_provisioner_action.fetch_action_request",
+            return_value=approved_request,
         ),
         patch(
-            "action_access_provisioner.access_provisioner_action.fetch_action_request"
-        ) as mock_fetch,
+            "action_access_provisioner.access_provisioner_action.is_already_provisioned",
+            return_value=False,
+        ),
+        patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch.object(action, "_provision") as mock_provision,
+    ):
+        action._handle_status_change(approved_request.urn)
+        mock_provision.assert_called_once()
+
+    action.close()
+
+
+def test_handle_status_change_denied_sends_email(
+    base_config_dict, mock_pipeline_context, denied_request
+):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(
+            "action_access_provisioner.access_provisioner_action.fetch_action_request",
+            return_value=denied_request,
+        ),
         patch(
             "action_access_provisioner.access_provisioner_action.send_denial_notification"
         ) as mock_email,
     ):
-        mock_fetch.return_value = denied_access_request
-
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._handle_status_change(denied_access_request.urn)
-
+        action._handle_status_change(denied_request.urn)
         mock_email.assert_called_once()
-        action.close()
+
+    action.close()
 
 
 # ---------------------------------------------------------------------------
-# SLA monitoring tests
+# Provisioning
 # ---------------------------------------------------------------------------
 
 
-def test_sla_warning_sent_once(base_config_dict, mock_pipeline_context):
-    """SLA warning should be sent only once per request, not on every poll cycle."""
+def test_provision_records_grant_state(base_config_dict, mock_pipeline_context, approved_request):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch(
+            "action_access_provisioner.access_provisioner_action.provision_access",
+            return_value=["GRANT USAGE ON DATABASE PROD TO ROLE ANALYST_ROLE"],
+        ),
+        patch("action_access_provisioner.access_provisioner_action.record_grant") as mock_record,
+        patch("action_access_provisioner.access_provisioner_action.send_approval_notification"),
+    ):
+        action._provision(approved_request)
+        mock_record.assert_called_once()
+        grant_arg = mock_record.call_args[0][1]
+        assert grant_arg.snowflake_role == "ANALYST_ROLE"
+        assert grant_arg.expires_at_ms is not None
+
+    action.close()
+
+
+def test_provision_skips_when_missing_role(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    approved_request.form_fields.snowflake_role = None
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with patch(
+        "action_access_provisioner.access_provisioner_action.provision_access"
+    ) as mock_provision:
+        action._provision(approved_request)
+        mock_provision.assert_not_called()
+
+    action.close()
+
+
+# ---------------------------------------------------------------------------
+# SLA evaluation — idempotency via Snowflake state
+# ---------------------------------------------------------------------------
+
+
+def test_sla_warning_not_sent_if_already_notified(base_config_dict, mock_pipeline_context):
     from action_access_provisioner.models import PendingRequestSummary
 
+    action = _create_action(base_config_dict, mock_pipeline_context)
     now_ms = int(time.time() * 1000)
-    old_request = PendingRequestSummary(
+    req = PendingRequestSummary(
         urn="urn:li:actionRequest:sla-001",
         created_ms=now_ms - 30 * 3_600_000,  # 30 hours ago
-        requestor_urn="urn:li:corpuser:charlie",
+        requestor_urn=None,
         requestor_email="charlie@example.com",
-        resource="urn:li:dataset:(urn:li:dataPlatform:snowflake,PROD.SALES.ORDERS,PROD)",
+        resource=None,
     )
+    mock_conn = MagicMock()
 
     with (
         patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
+            "action_access_provisioner.access_provisioner_action.is_sla_notified",
+            return_value=True,
         ),
         patch("action_access_provisioner.access_provisioner_action.send_sla_warning") as mock_warn,
     ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+        action._evaluate_sla(req, now_ms, mock_conn)
+        mock_warn.assert_not_called()
 
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-
-        # Call twice to verify deduplication
-        action._evaluate_sla(old_request, now_ms)
-        action._evaluate_sla(old_request, now_ms)
-
-        mock_warn.assert_called_once()
-        action.close()
+    action.close()
 
 
-def test_sla_escalation_sent_for_very_old_request(base_config_dict, mock_pipeline_context):
+def test_sla_warning_sent_and_recorded(base_config_dict, mock_pipeline_context):
     from action_access_provisioner.models import PendingRequestSummary
 
+    action = _create_action(base_config_dict, mock_pipeline_context)
     now_ms = int(time.time() * 1000)
-    very_old_request = PendingRequestSummary(
+    req = PendingRequestSummary(
         urn="urn:li:actionRequest:sla-002",
-        created_ms=now_ms - 80 * 3_600_000,  # 80 hours ago
-        requestor_urn="urn:li:corpuser:dave",
+        created_ms=now_ms - 30 * 3_600_000,
+        requestor_urn=None,
         requestor_email="dave@example.com",
         resource=None,
     )
+    mock_conn = MagicMock()
 
     with (
         patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
+            "action_access_provisioner.access_provisioner_action.is_sla_notified",
+            return_value=False,
+        ),
+        patch("action_access_provisioner.access_provisioner_action.send_sla_warning") as mock_warn,
+        patch(
+            "action_access_provisioner.access_provisioner_action.record_sla_notification"
+        ) as mock_record,
+    ):
+        action._evaluate_sla(req, now_ms, mock_conn)
+        mock_warn.assert_called_once()
+        mock_record.assert_called_once()
+
+    action.close()
+
+
+def test_sla_escalation_sent_for_old_request(base_config_dict, mock_pipeline_context):
+    from action_access_provisioner.models import PendingRequestSummary
+
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    now_ms = int(time.time() * 1000)
+    req = PendingRequestSummary(
+        urn="urn:li:actionRequest:sla-003",
+        created_ms=now_ms - 80 * 3_600_000,  # 80 hours
+        requestor_urn=None,
+        requestor_email="eve@example.com",
+        resource=None,
+    )
+    mock_conn = MagicMock()
+
+    with (
+        patch(
+            "action_access_provisioner.access_provisioner_action.is_sla_notified",
+            return_value=False,
         ),
         patch(
             "action_access_provisioner.access_provisioner_action.send_escalation_alert"
         ) as mock_escalate,
         patch("action_access_provisioner.access_provisioner_action.send_sla_warning") as mock_warn,
+        patch("action_access_provisioner.access_provisioner_action.record_sla_notification"),
     ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-        action._evaluate_sla(very_old_request, now_ms)
-
+        action._evaluate_sla(req, now_ms, mock_conn)
         mock_escalate.assert_called_once()
-        # Should not double-send a warning when escalation fires
         mock_warn.assert_not_called()
-        action.close()
+
+    action.close()
 
 
 # ---------------------------------------------------------------------------
-# Expiry / revocation tests
+# Expiry catchup
 # ---------------------------------------------------------------------------
 
 
-def test_expired_grant_is_revoked(base_config_dict, mock_pipeline_context):
+def test_expiry_catchup_revokes_and_notifies(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    expired = GrantRecord(
+        action_request_urn="urn:li:actionRequest:expired-001",
+        snowflake_role="OLD_ROLE",
+        snowflake_database="PROD",
+        snowflake_schema="SALES",
+        requestor_email="eve@example.com",
+        granted_at_ms=int(time.time() * 1000) - 31 * 86_400_000,
+        expires_at_ms=int(time.time() * 1000) - 1000,
+    )
+
     with (
-        patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-        ),
         patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch(
+            "action_access_provisioner.access_provisioner_action.get_expired_grants",
+            return_value=[expired],
+        ),
         patch("action_access_provisioner.access_provisioner_action.revoke_access") as mock_revoke,
+        patch(
+            "action_access_provisioner.access_provisioner_action.record_revocation"
+        ) as mock_record_rev,
         patch(
             "action_access_provisioner.access_provisioner_action.send_revocation_notification"
         ) as mock_notify,
     ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-
-        expired_grant = GrantRecord(
-            action_request_urn="urn:li:actionRequest:expired-001",
-            snowflake_role="OLD_ROLE",
-            snowflake_database="PROD",
-            snowflake_schema="SALES",
-            requestor_email="eve@example.com",
-            granted_at_ms=int(time.time() * 1000) - 31 * 86_400_000,
-            expires_at_ms=int(time.time() * 1000) - 1000,  # expired 1 second ago
-        )
-        action._active_grants["urn:li:actionRequest:expired-001"] = expired_grant
-
-        action._check_expiry()
+        action._catchup_expiry()
 
         mock_revoke.assert_called_once()
-        mock_notify.assert_called_once()
-        # Grant should be removed from the registry
-        assert "urn:li:actionRequest:expired-001" not in action._active_grants
-        action.close()
-
-
-def test_non_expired_grant_not_revoked(base_config_dict, mock_pipeline_context):
-    with (
-        patch(
-            "action_access_provisioner.access_provisioner_action.AccessProvisionerAction._start_background_threads"
-        ),
-        patch("action_access_provisioner.access_provisioner_action.revoke_access") as mock_revoke,
-    ):
-        from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
-
-        action = AccessProvisionerAction.create(base_config_dict, mock_pipeline_context)
-
-        active_grant = GrantRecord(
-            action_request_urn="urn:li:actionRequest:active-001",
-            snowflake_role="CURRENT_ROLE",
-            snowflake_database="PROD",
-            snowflake_schema=None,
-            requestor_email="frank@example.com",
-            granted_at_ms=int(time.time() * 1000),
-            expires_at_ms=int(time.time() * 1000) + 30 * 86_400_000,  # 30 days in future
+        mock_record_rev.assert_called_once_with(
+            mock_revoke.call_args[0][0],
+            "urn:li:actionRequest:expired-001",
+            action.config.state,
         )
-        action._active_grants["urn:li:actionRequest:active-001"] = active_grant
+        mock_notify.assert_called_once()
 
-        action._check_expiry()
-
-        mock_revoke.assert_not_called()
-        assert "urn:li:actionRequest:active-001" in action._active_grants
-        action.close()
+    action.close()

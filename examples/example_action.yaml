@@ -2,17 +2,31 @@
 #
 # Author: Jonny Dixon
 #
-# This action listens for DataHub workflow access-request approvals and:
-#   1. Executes the corresponding Snowflake GRANT statements
-#   2. Sends a confirmation email to the requestor via Gmail
-#   3. Monitors pending requests and sends SLA reminder / escalation emails
-#   4. Auto-revokes Snowflake access when the declared access duration expires
+# SCHEDULING NOTE
+# ---------------
+# The DataHub Cloud executor kills actions after ~5 minutes of idle time.
+# This action is therefore designed to be run on a schedule (e.g. every 30 minutes)
+# rather than as a persistent daemon.
+#
+# On each invocation the action:
+#   1. Runs a startup catchup pass:
+#        - Fetches all COMPLETED/APPROVED requests from the last N days
+#        - Skips any already recorded in the Snowflake state table (idempotent)
+#        - Provisions Snowflake access + emails for any new approvals
+#        - Revokes any grants whose access_duration has expired
+#        - Sends SLA reminders for pending requests (deduped via state table)
+#   2. Listens for live events for the remaining ~5-minute window
+#
+# Recommended scheduling: every 30 minutes via cron or your DataHub scheduler.
+# Example cron: */30 * * * * datahub actions -c /path/to/example_action.yaml
 
 name: access-provisioner
 
 source:
   type: "datahub-cloud"
   config:
+    # Allow the full idle window before the executor shuts down the action.
+    # Set to false so the process stays alive during the 5-min window for live events.
     kill_after_idle_timeout: false
 
 action:
@@ -26,12 +40,19 @@ action:
       username: "datahub_provisioner"
       password: "${SNOWFLAKE_PASSWORD}"
       warehouse: "COMPUTE_WH"
-      role: "SYSADMIN"                   # Must have GRANT privilege
+      role: "SYSADMIN"                   # Must have GRANT OPTION privilege
       authentication_type: "DEFAULT_AUTHENTICATOR"
-      # For key-pair auth, use:
-      # authentication_type: "KEY_PAIR_AUTHENTICATOR"
-      # private_key_path: "/secrets/snowflake_key.pem"
-      # private_key_password: "${SNOWFLAKE_KEY_PASSWORD}"
+
+    # ----------------------------------------------------------------
+    # Persistent state tables
+    # Tracks provisioned grants and sent notifications across runs.
+    # The schema must already exist; the tables are created on first run.
+    # ----------------------------------------------------------------
+    state:
+      database: "DATAHUB"
+      schema: "ACCESS_PROVISIONER"
+      grants_table: "ACCESS_PROVISIONER_GRANTS"          # default
+      sla_table: "ACCESS_PROVISIONER_SLA_NOTIFICATIONS"  # default
 
     # ----------------------------------------------------------------
     # Gmail SMTP (outbound email notifications)
@@ -46,20 +67,19 @@ action:
 
     # ----------------------------------------------------------------
     # SLA monitoring
+    # Each threshold fires at most once per request (deduped in state table).
     # ----------------------------------------------------------------
     sla:
       warning_after_hours: 24            # Send reminder after 24 h
       escalation_after_hours: 72         # Escalate after 72 h
       escalation_recipients:             # CC'd on escalation emails
         - "data-governance@yourdomain.com"
-      check_interval_seconds: 3600       # Poll every hour
 
     # ----------------------------------------------------------------
     # Access expiry / auto-revocation
     # ----------------------------------------------------------------
     expiry:
       enabled: true
-      check_interval_seconds: 3600
       revocation_notification: true      # Email requestor on revocation
 
     # ----------------------------------------------------------------
@@ -70,8 +90,15 @@ action:
       dry_run: false                     # Set true to test without executing
 
     # ----------------------------------------------------------------
+    # Catchup window — how far back to scan DataHub for approved requests
+    # on each startup pass. Requests outside this window are assumed
+    # already handled. 90 days is a safe default.
+    # ----------------------------------------------------------------
+    lookback_days: 90
+
+    # ----------------------------------------------------------------
     # Workflow form field IDs
-    # These must match the `id` values you defined in your DataHub workflow form.
+    # Must match the `id` values defined in your DataHub workflow form.
     # ----------------------------------------------------------------
     field_snowflake_database: "snowflake_database"
     field_snowflake_schema: "snowflake_schema"

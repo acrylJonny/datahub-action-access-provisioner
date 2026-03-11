@@ -1,10 +1,13 @@
 """DataHub GraphQL helpers for querying access requests."""
 
 import logging
+import time
 from typing import Any, Optional
 
 from .models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
+    REQUEST_RESULT_APPROVED,
+    REQUEST_STATUS_COMPLETED,
     REQUEST_STATUS_PENDING,
     AccessRequest,
     FormFieldValues,
@@ -44,6 +47,68 @@ query fetchActionRequest($urn: String!) {
       status
       result
       note
+    }
+  }
+}
+"""
+
+# Shared fragment for workflow form request fields (reused by multiple queries)
+_WORKFLOW_FORM_FRAGMENT = """
+fragment WorkflowFormFields on ActionRequest {
+  urn
+  actionRequestInfo {
+    type
+    resource
+    created
+    createdBy { urn }
+    assignedUsers { urn }
+    assignedGroups { urn }
+    params {
+      workflowFormRequest {
+        fields {
+          id
+          values {
+            ... on StringValue { stringValue }
+            ... on NumberValue { numberValue }
+          }
+        }
+      }
+    }
+  }
+  actionRequestStatus { status result }
+}
+"""
+
+# GraphQL search query for COMPLETED/APPROVED access requests within a time window
+_SEARCH_APPROVED_REQUESTS_QUERY = """
+query searchApprovedRequests($input: SearchAcrossEntitiesInput!) {
+  searchAcrossEntities(input: $input) {
+    total
+    searchResults {
+      entity {
+        urn
+        ... on ActionRequest {
+          actionRequestInfo {
+            type
+            resource
+            created
+            createdBy { urn }
+            params {
+              workflowFormRequest {
+                fields {
+                  id
+                  values {
+                    ... on StringValue { stringValue }
+                    ... on NumberValue { numberValue }
+                  }
+                }
+                access { expiresAt }
+              }
+            }
+          }
+          actionRequestStatus { status result note }
+        }
+      }
     }
   }
 }
@@ -204,6 +269,76 @@ def fetch_pending_action_requests(
         )
 
     return pending
+
+
+def fetch_all_approved_requests(
+    graph,
+    config_field_ids: dict[str, str],
+    lookback_days: int = 90,
+    batch_size: int = 100,
+) -> list[AccessRequest]:
+    """
+    Return all COMPLETED/APPROVED workflow access requests created within the lookback window.
+
+    This is called on startup to catch up on any requests that were approved while the action
+    was not running. The caller is responsible for filtering out requests that have already
+    been provisioned (using the Snowflake state table).
+    """
+    since_ms = int((time.time() - lookback_days * 86_400) * 1000)
+    approved: list[AccessRequest] = []
+    start = 0
+
+    while True:
+        variables = {
+            "input": {
+                "types": ["ACTION_REQUEST"],
+                "query": "*",
+                "start": start,
+                "count": batch_size,
+                "filters": [
+                    {"field": "status", "value": REQUEST_STATUS_COMPLETED},
+                    {"field": "result", "value": REQUEST_RESULT_APPROVED},
+                    {"field": "type", "value": ACTION_REQUEST_TYPE_WORKFLOW},
+                ],
+                # Filter by creation time so old handled requests don't pile up
+                "orFilters": [
+                    {
+                        "and": [
+                            {
+                                "field": "created",
+                                "condition": "GREATER_THAN_OR_EQUAL_TO",
+                                "value": str(since_ms),
+                            }
+                        ]
+                    }
+                ],
+            }
+        }
+
+        try:
+            result = graph.execute_graphql(_SEARCH_APPROVED_REQUESTS_QUERY, variables=variables)
+        except Exception as exc:
+            logger.error(f"GraphQL error fetching approved requests (start={start}): {exc}")
+            break
+
+        data = (result or {}).get("searchAcrossEntities", {})
+        search_results = data.get("searchResults", [])
+        total = data.get("total", 0)
+
+        for item in search_results:
+            entity = item.get("entity", {})
+            if not entity:
+                continue
+            node = _parse_action_request_node(entity, config_field_ids)
+            if node.request_type == ACTION_REQUEST_TYPE_WORKFLOW:
+                approved.append(node)
+
+        start += len(search_results)
+        if start >= total or not search_results:
+            break
+
+    logger.info(f"[GraphQL] Found {len(approved)} approved requests in last {lookback_days} days")
+    return approved
 
 
 def _parse_action_request_node(

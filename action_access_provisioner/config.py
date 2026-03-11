@@ -30,6 +30,37 @@ class SmtpConfig(BaseModel):
         return self.from_address or self.username
 
 
+class StateConfig(BaseModel):
+    """
+    Snowflake tables used to persist provisioning state across runs.
+
+    Because the DataHub executor kills the action after ~5 minutes of idle time,
+    all state that must survive across scheduled invocations is stored here rather
+    than in memory.
+    """
+
+    database: str = Field(description="Snowflake database that holds the state tables")
+    schema_name: str = Field(
+        description="Snowflake schema that holds the state tables", alias="schema"
+    )
+    grants_table: str = Field(
+        default="ACCESS_PROVISIONER_GRANTS",
+        description="Table tracking every provisioned grant (used for idempotency and expiry)",
+    )
+    sla_table: str = Field(
+        default="ACCESS_PROVISIONER_SLA_NOTIFICATIONS",
+        description="Table tracking sent SLA notifications (prevents duplicate emails across runs)",
+    )
+
+    @property
+    def qualified_grants_table(self) -> str:
+        return f"{self.database}.{self.schema_name}.{self.grants_table}"
+
+    @property
+    def qualified_sla_table(self) -> str:
+        return f"{self.database}.{self.schema_name}.{self.sla_table}"
+
+
 class SlaConfig(BaseModel):
     """SLA monitoring configuration for open access requests."""
 
@@ -45,10 +76,6 @@ class SlaConfig(BaseModel):
         default_factory=list,
         description="Email addresses to CC on escalation alerts (e.g. team leads)",
     )
-    check_interval_seconds: int = Field(
-        default=3600,
-        description="How often (in seconds) to poll DataHub for pending requests that breach SLA",
-    )
 
 
 class ExpiryConfig(BaseModel):
@@ -57,10 +84,6 @@ class ExpiryConfig(BaseModel):
     enabled: bool = Field(
         default=True,
         description="Whether to auto-revoke Snowflake access when the declared access duration expires",
-    )
-    check_interval_seconds: int = Field(
-        default=3600,
-        description="How often (in seconds) to poll for expired grants and revoke them",
     )
     revocation_notification: bool = Field(
         default=True,
@@ -87,12 +110,27 @@ class AccessProvisionerConfig(BaseModel):
     snowflake_connection: SnowflakeConnectionConfig = Field(
         description="Snowflake connection used to execute GRANT/REVOKE statements"
     )
+    state: StateConfig = Field(
+        description=(
+            "Snowflake database/schema/table names used to persist grant state and SLA "
+            "notifications across scheduled runs"
+        )
+    )
     smtp: SmtpConfig = Field(description="Gmail SMTP configuration for email notifications")
     sla: SlaConfig = Field(
-        default_factory=SlaConfig, description="SLA monitoring and reminder settings"
+        default_factory=SlaConfig,
+        description="SLA monitoring and reminder settings",
     )
     expiry: ExpiryConfig = Field(
-        default_factory=ExpiryConfig, description="Access expiry / auto-revocation settings"
+        default_factory=ExpiryConfig,
+        description="Access expiry / auto-revocation settings",
+    )
+    lookback_days: int = Field(
+        default=90,
+        description=(
+            "How many days back to scan DataHub for approved requests on each startup catchup pass. "
+            "Requests outside this window are assumed to have been handled by a previous run."
+        ),
     )
     provisioning: SnowflakeProvisioningConfig = Field(
         default_factory=SnowflakeProvisioningConfig,

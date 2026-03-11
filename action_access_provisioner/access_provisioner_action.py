@@ -1,7 +1,26 @@
-"""DataHub Action: automated Snowflake access provisioning, SLA tracking, and expiry revocation."""
+"""DataHub Action: automated Snowflake access provisioning, SLA tracking, and expiry revocation.
+
+Design note — scheduled invocation model
+-----------------------------------------
+The DataHub Cloud executor kills Actions after ~5 minutes of idle time, so this
+action is designed to be run on a schedule (e.g. every 30 minutes via cron or the
+DataHub scheduler) rather than as a persistent daemon.
+
+On each invocation the action:
+  1. Runs a *catchup pass* at startup:
+       a. Fetches all COMPLETED/APPROVED workflow requests from the last N days.
+       b. Skips any already recorded in the Snowflake state table (idempotent).
+       c. Provisions Snowflake access + sends email for any new approvals.
+       d. Checks every active grant for expiry; revokes + emails if expired.
+       e. Checks every pending request for SLA breaches; emails if not already notified.
+  2. Listens for live MCL events during the remaining ~5-minute window and handles
+     any new status-change events in real time.
+
+All state (provisioned grants, sent SLA notifications) is stored in Snowflake tables
+so it persists across invocations and prevents duplicate actions.
+"""
 
 import logging
-import threading
 import time
 from typing import Any, Optional
 
@@ -18,51 +37,49 @@ from .email import (
     send_revocation_notification,
     send_sla_warning,
 )
-from .graphql import fetch_action_request, fetch_pending_action_requests
+from .graphql import (
+    fetch_action_request,
+    fetch_all_approved_requests,
+    fetch_pending_action_requests,
+)
 from .models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
+    AccessRequest,
     GrantRecord,
     PendingRequestSummary,
 )
-from .snowflake import get_connection, provision_access, revoke_access
+from .snowflake import (
+    ensure_state_tables,
+    get_connection,
+    get_expired_grants,
+    is_already_provisioned,
+    is_sla_notified,
+    provision_access,
+    record_grant,
+    record_revocation,
+    record_sla_notification,
+    revoke_access,
+)
 
 logger = logging.getLogger(__name__)
 
-# MCL aspect names we care about
 _ASPECT_ACTION_REQUEST_STATUS = "actionRequestStatus"
 
-# Track which SLA warnings have already been sent to avoid duplicate emails.
-# Key: action_request_urn  Value: set of thresholds (hours) already notified.
-_SlaTracker = dict[str, set]
+_SLA_TYPE_WARNING = "warning"
+_SLA_TYPE_ESCALATION = "escalation"
 
 
 class AccessProvisionerAction(Action):
     """
-    DataHub Actions handler that:
+    DataHub Actions handler for automated Snowflake access provisioning.
 
-    1. Reacts to ``actionRequestStatus`` MCL events and, when an ACCESS workflow
-       request is APPROVED, executes Snowflake GRANT statements and sends a
-       confirmation email.
-    2. Runs a background thread that polls for pending requests exceeding SLA
-       thresholds and sends reminder / escalation emails.
-    3. Runs a background thread that polls for expired grants and auto-revokes
-       the corresponding Snowflake privileges, then notifies the original requestor.
+    See module docstring for the full scheduling model.
     """
 
     def __init__(self, config: AccessProvisionerConfig, ctx: PipelineContext) -> None:
         self.config = config
         self.ctx = ctx
         self._snowflake_conn: Any = None
-
-        # In-memory store of active grants keyed by action_request_urn.
-        # In production you may want to back this with a persistent store.
-        self._active_grants: dict[str, GrantRecord] = {}
-
-        # Track which SLA thresholds have already been notified per request.
-        self._sla_notified: _SlaTracker = {}
-
-        self._stop_event = threading.Event()
-        self._background_threads: list[threading.Thread] = []
 
         logger.info("[AccessProvisioner] Initialised")
         if config.provisioning.dry_run:
@@ -78,11 +95,93 @@ class AccessProvisionerAction(Action):
     def create(cls, config_dict: dict, ctx: PipelineContext) -> "Action":
         config = AccessProvisionerConfig.model_validate(config_dict or {})
         action = cls(config, ctx)
-        action._start_background_threads()
+        action._startup_catchup()
         return action
 
     # ------------------------------------------------------------------
-    # Main event handler
+    # Startup catchup pass
+    # ------------------------------------------------------------------
+
+    def _startup_catchup(self) -> None:
+        """
+        Called once at startup. Processes any backlog of approved requests and
+        handles expiry/SLA checks for the current state of the world.
+        """
+        logger.info("[Catchup] Starting startup catchup pass…")
+
+        try:
+            conn = self._get_snowflake_connection()
+            ensure_state_tables(conn, self.config.state)
+        except Exception as exc:
+            logger.error(
+                f"[Catchup] Cannot connect to Snowflake or create state tables: {exc}",
+                exc_info=True,
+            )
+            return
+
+        self._catchup_approved_requests()
+        self._catchup_expiry()
+        self._catchup_sla()
+
+        logger.info("[Catchup] Startup catchup pass complete")
+
+    def _catchup_approved_requests(self) -> None:
+        """Provision any approved requests not yet in the state table."""
+        config_field_ids = self._field_id_map()
+        approved = fetch_all_approved_requests(
+            self.ctx.graph,
+            config_field_ids,
+            lookback_days=self.config.lookback_days,
+        )
+        conn = self._get_snowflake_connection()
+        new_count = 0
+        for request in approved:
+            if is_already_provisioned(conn, request.urn, self.config.state):
+                logger.debug(f"[Catchup] {request.urn} already provisioned — skipping")
+                continue
+            self._provision(request)
+            new_count += 1
+        logger.info(f"[Catchup] Provisioned {new_count} new request(s) from backlog")
+
+    def _catchup_expiry(self) -> None:
+        """Revoke any grants that expired since the last run."""
+        if not self.config.expiry.enabled:
+            return
+        conn = self._get_snowflake_connection()
+        expired = get_expired_grants(conn, self.config.state)
+        for grant in expired:
+            logger.info(
+                f"[Expiry] Revoking expired grant for {grant.action_request_urn} "
+                f"(role={grant.snowflake_role}, db={grant.snowflake_database})"
+            )
+            try:
+                revoke_access(conn, grant, self.config.provisioning)
+                record_revocation(conn, grant.action_request_urn, self.config.state)
+            except Exception as exc:
+                logger.error(
+                    f"[Expiry] Failed to revoke {grant.action_request_urn}: {exc}",
+                    exc_info=True,
+                )
+                continue
+
+            if self.config.expiry.revocation_notification:
+                try:
+                    send_revocation_notification(self.config.smtp, grant)
+                except Exception as exc:
+                    logger.error(f"[Expiry] Failed to send revocation email: {exc}")
+
+    def _catchup_sla(self) -> None:
+        """Send SLA reminders/escalations for pending requests that breach configured thresholds."""
+        config_field_ids = self._field_id_map()
+        pending = fetch_pending_action_requests(self.ctx.graph, config_field_ids)
+        now_ms = int(time.time() * 1000)
+        conn = self._get_snowflake_connection()
+
+        for req in pending:
+            self._evaluate_sla(req, now_ms, conn)
+
+    # ------------------------------------------------------------------
+    # Live event handler
     # ------------------------------------------------------------------
 
     def act(self, event: EventEnvelope) -> None:
@@ -90,79 +189,63 @@ class AccessProvisionerAction(Action):
             return
 
         mcl: MetadataChangeLogEvent = event.event  # type: ignore[assignment]
-        entity_type = getattr(mcl, "entityType", None)
-        aspect_name = getattr(mcl, "aspectName", None)
-
-        if entity_type != "actionRequest" or aspect_name != _ASPECT_ACTION_REQUEST_STATUS:
+        if getattr(mcl, "entityType", None) != "actionRequest":
+            return
+        if getattr(mcl, "aspectName", None) != _ASPECT_ACTION_REQUEST_STATUS:
             return
 
         entity_urn = getattr(mcl, "entityUrn", None)
         if not entity_urn:
             return
 
-        logger.debug(f"[AccessProvisioner] actionRequestStatus change on {entity_urn}")
+        logger.debug(f"[Live] actionRequestStatus change on {entity_urn}")
         self._handle_status_change(entity_urn)
 
     # ------------------------------------------------------------------
-    # Status change handler
+    # Status change handler (used by both live events and catchup)
     # ------------------------------------------------------------------
 
     def _handle_status_change(self, action_request_urn: str) -> None:
-        """Fetch the full request and react to its new status."""
-        config_field_ids = {
-            "field_snowflake_database": self.config.field_snowflake_database,
-            "field_snowflake_schema": self.config.field_snowflake_schema,
-            "field_snowflake_role": self.config.field_snowflake_role,
-            "field_access_duration_days": self.config.field_access_duration_days,
-            "field_requestor_email": self.config.field_requestor_email,
-            "field_justification": self.config.field_justification,
-        }
-
-        request = fetch_action_request(self.ctx.graph, action_request_urn, config_field_ids)
+        request = fetch_action_request(self.ctx.graph, action_request_urn, self._field_id_map())
         if not request:
-            logger.warning(f"[AccessProvisioner] Could not fetch request {action_request_urn}")
+            logger.warning(f"[Live] Could not fetch request {action_request_urn}")
             return
-
         if request.request_type != ACTION_REQUEST_TYPE_WORKFLOW:
-            logger.debug(
-                f"[AccessProvisioner] Ignoring non-workflow request type {request.request_type}"
-            )
             return
 
         if request.is_approved:
+            conn = self._get_snowflake_connection()
+            if is_already_provisioned(conn, action_request_urn, self.config.state):
+                logger.info(
+                    f"[Live] {action_request_urn} already provisioned — skipping duplicate event"
+                )
+                return
             self._provision(request)
         elif request.is_denied:
-            logger.info(
-                f"[AccessProvisioner] Request {action_request_urn} denied — sending notification"
-            )
             try:
                 send_denial_notification(self.config.smtp, request)
             except Exception as exc:
-                logger.error(f"[AccessProvisioner] Failed to send denial email: {exc}")
-        else:
-            logger.debug(
-                f"[AccessProvisioner] Request {action_request_urn} status={request.status} — no action"
-            )
+                logger.error(f"[Live] Failed to send denial email: {exc}")
 
     # ------------------------------------------------------------------
     # Provisioning
     # ------------------------------------------------------------------
 
-    def _provision(self, request) -> None:  # type: ignore[no-untyped-def]
+    def _provision(self, request: AccessRequest) -> None:
         ff = request.form_fields
         role = ff.snowflake_role
         database = ff.snowflake_database
 
         if not role or not database:
             logger.error(
-                f"[AccessProvisioner] Request {request.urn} is missing required fields "
-                f"(role={role!r}, database={database!r}) — skipping provisioning"
+                f"[Provision] Request {request.urn} missing required fields "
+                f"(role={role!r}, database={database!r}) — skipping"
             )
             return
 
         logger.info(
-            f"[AccessProvisioner] Provisioning: role={role} database={database} "
-            f"schema={ff.snowflake_schema!r} for request {request.urn}"
+            f"[Provision] role={role} database={database} schema={ff.snowflake_schema!r} "
+            f"for request {request.urn}"
         )
 
         try:
@@ -176,16 +259,13 @@ class AccessProvisionerAction(Action):
                 provisioning=self.config.provisioning,
             )
             logger.info(
-                f"[AccessProvisioner] Provisioned {len(sql_statements)} statement(s) for {request.urn}"
+                f"[Provision] {len(sql_statements)} statement(s) executed for {request.urn}"
             )
         except Exception as exc:
-            logger.error(
-                f"[AccessProvisioner] Snowflake provisioning failed for {request.urn}: {exc}",
-                exc_info=True,
-            )
+            logger.error(f"[Provision] Snowflake error for {request.urn}: {exc}", exc_info=True)
             return
 
-        # Record the grant for later expiry checking
+        # Persist grant to Snowflake state table
         expires_at_ms: Optional[int] = None
         if ff.access_duration_days:
             expires_at_ms = int(time.time() * 1000) + ff.access_duration_days * 86_400_000
@@ -199,66 +279,64 @@ class AccessProvisionerAction(Action):
             granted_at_ms=int(time.time() * 1000),
             expires_at_ms=expires_at_ms,
         )
-        self._active_grants[request.urn] = grant
+        try:
+            record_grant(conn, grant, self.config.state)
+        except Exception as exc:
+            logger.error(f"[Provision] Failed to record grant state for {request.urn}: {exc}")
 
-        # Send approval email
         try:
             send_approval_notification(self.config.smtp, request, sql_statements)
         except Exception as exc:
-            logger.error(f"[AccessProvisioner] Failed to send approval email: {exc}")
+            logger.error(f"[Provision] Failed to send approval email: {exc}")
 
     # ------------------------------------------------------------------
-    # Background threads
+    # SLA evaluation
     # ------------------------------------------------------------------
 
-    def _start_background_threads(self) -> None:
-        sla_thread = threading.Thread(
-            target=self._sla_monitor_loop,
-            name="access-provisioner-sla-monitor",
-            daemon=True,
-        )
-        sla_thread.start()
-        self._background_threads.append(sla_thread)
+    def _evaluate_sla(self, req: PendingRequestSummary, now_ms: int, conn: Any) -> None:
+        if not req.created_ms:
+            return
 
-        if self.config.expiry.enabled:
-            expiry_thread = threading.Thread(
-                target=self._expiry_monitor_loop,
-                name="access-provisioner-expiry-monitor",
-                daemon=True,
-            )
-            expiry_thread.start()
-            self._background_threads.append(expiry_thread)
+        pending_hours = (now_ms - req.created_ms) / 3_600_000
+        assignee_emails = [req.requestor_email] if req.requestor_email else []
 
-        logger.info(
-            f"[AccessProvisioner] Started {len(self._background_threads)} background thread(s)"
-        )
+        if pending_hours >= self.config.sla.escalation_after_hours:
+            if not is_sla_notified(conn, req.urn, _SLA_TYPE_ESCALATION, self.config.state):
+                logger.info(f"[SLA] Escalating {req.urn} (pending {pending_hours:.1f}h)")
+                try:
+                    send_escalation_alert(
+                        smtp_config=self.config.smtp,
+                        action_request_urn=req.urn,
+                        resource=req.resource,
+                        pending_hours=pending_hours,
+                        assignee_emails=assignee_emails,
+                        escalation_recipients=self.config.sla.escalation_recipients,
+                    )
+                    record_sla_notification(conn, req.urn, _SLA_TYPE_ESCALATION, self.config.state)
+                except Exception as exc:
+                    logger.error(f"[SLA] Failed escalation for {req.urn}: {exc}")
 
-    def _sla_monitor_loop(self) -> None:
-        """Periodically poll DataHub for pending requests and send SLA reminders."""
-        interval = self.config.sla.check_interval_seconds
-        logger.info(f"[SLA Monitor] Starting (check every {interval}s)")
+        elif pending_hours >= self.config.sla.warning_after_hours:
+            if not is_sla_notified(conn, req.urn, _SLA_TYPE_WARNING, self.config.state):
+                logger.info(f"[SLA] Warning for {req.urn} (pending {pending_hours:.1f}h)")
+                try:
+                    send_sla_warning(
+                        smtp_config=self.config.smtp,
+                        action_request_urn=req.urn,
+                        resource=req.resource,
+                        pending_hours=pending_hours,
+                        assignee_emails=assignee_emails,
+                    )
+                    record_sla_notification(conn, req.urn, _SLA_TYPE_WARNING, self.config.state)
+                except Exception as exc:
+                    logger.error(f"[SLA] Failed warning for {req.urn}: {exc}")
 
-        while not self._stop_event.is_set():
-            try:
-                self._check_sla()
-            except Exception as exc:
-                logger.error(f"[SLA Monitor] Unexpected error: {exc}", exc_info=True)
-            self._stop_event.wait(interval)
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _expiry_monitor_loop(self) -> None:
-        """Periodically check the in-memory grant registry and revoke expired grants."""
-        interval = self.config.expiry.check_interval_seconds
-        logger.info(f"[Expiry Monitor] Starting (check every {interval}s)")
-
-        while not self._stop_event.is_set():
-            try:
-                self._check_expiry()
-            except Exception as exc:
-                logger.error(f"[Expiry Monitor] Unexpected error: {exc}", exc_info=True)
-            self._stop_event.wait(interval)
-
-    def _check_sla(self) -> None:
-        config_field_ids = {
+    def _field_id_map(self) -> dict[str, str]:
+        return {
             "field_snowflake_database": self.config.field_snowflake_database,
             "field_snowflake_schema": self.config.field_snowflake_schema,
             "field_snowflake_role": self.config.field_snowflake_role,
@@ -266,90 +344,6 @@ class AccessProvisionerAction(Action):
             "field_requestor_email": self.config.field_requestor_email,
             "field_justification": self.config.field_justification,
         }
-        pending = fetch_pending_action_requests(self.ctx.graph, config_field_ids)
-        now_ms = int(time.time() * 1000)
-
-        for req in pending:
-            self._evaluate_sla(req, now_ms)
-
-    def _evaluate_sla(self, req: PendingRequestSummary, now_ms: int) -> None:
-        if not req.created_ms:
-            return
-
-        pending_hours = (now_ms - req.created_ms) / 3_600_000
-        notified = self._sla_notified.setdefault(req.urn, set())
-
-        assignee_emails: list[str] = []
-        # In practice you would look up email addresses for assignee URNs.
-        # We surface what we have — the requestor_email is a fallback.
-        if req.requestor_email:
-            assignee_emails.append(req.requestor_email)
-
-        if pending_hours >= self.config.sla.escalation_after_hours and "escalation" not in notified:
-            logger.info(f"[SLA Monitor] Escalating {req.urn} (pending {pending_hours:.1f}h)")
-            try:
-                send_escalation_alert(
-                    smtp_config=self.config.smtp,
-                    action_request_urn=req.urn,
-                    resource=req.resource,
-                    pending_hours=pending_hours,
-                    assignee_emails=assignee_emails,
-                    escalation_recipients=self.config.sla.escalation_recipients,
-                )
-                notified.add("escalation")
-            except Exception as exc:
-                logger.error(f"[SLA Monitor] Failed to send escalation: {exc}")
-
-        elif pending_hours >= self.config.sla.warning_after_hours and "warning" not in notified:
-            logger.info(f"[SLA Monitor] Warning for {req.urn} (pending {pending_hours:.1f}h)")
-            try:
-                send_sla_warning(
-                    smtp_config=self.config.smtp,
-                    action_request_urn=req.urn,
-                    resource=req.resource,
-                    pending_hours=pending_hours,
-                    assignee_emails=assignee_emails,
-                )
-                notified.add("warning")
-            except Exception as exc:
-                logger.error(f"[SLA Monitor] Failed to send warning: {exc}")
-
-    def _check_expiry(self) -> None:
-        now_ms = int(time.time() * 1000)
-        expired_urns = [
-            urn
-            for urn, grant in self._active_grants.items()
-            if grant.has_expiry
-            and grant.expires_at_ms is not None
-            and grant.expires_at_ms <= now_ms
-        ]
-
-        for urn in expired_urns:
-            grant = self._active_grants.pop(urn)
-            logger.info(
-                f"[Expiry Monitor] Revoking expired grant for {urn} "
-                f"(role={grant.snowflake_role}, db={grant.snowflake_database})"
-            )
-            try:
-                conn = self._get_snowflake_connection()
-                revoke_access(conn, grant, self.config.provisioning)
-            except Exception as exc:
-                logger.error(
-                    f"[Expiry Monitor] Failed to revoke access for {urn}: {exc}", exc_info=True
-                )
-                # Put the grant back so we retry on the next cycle
-                self._active_grants[urn] = grant
-                continue
-
-            if self.config.expiry.revocation_notification:
-                try:
-                    send_revocation_notification(self.config.smtp, grant)
-                except Exception as exc:
-                    logger.error(f"[Expiry Monitor] Failed to send revocation email: {exc}")
-
-    # ------------------------------------------------------------------
-    # Snowflake connection management
-    # ------------------------------------------------------------------
 
     def _get_snowflake_connection(self) -> Any:
         if self._snowflake_conn is None:
@@ -363,11 +357,7 @@ class AccessProvisionerAction(Action):
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        logger.info("[AccessProvisioner] Shutting down…")
-        self._stop_event.set()
-        for t in self._background_threads:
-            t.join(timeout=5)
         if self._snowflake_conn:
             self._snowflake_conn.close()
             self._snowflake_conn = None
-        logger.info("[AccessProvisioner] Shutdown complete")
+        logger.info("[AccessProvisioner] Closed")
