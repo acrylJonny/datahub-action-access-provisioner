@@ -468,9 +468,10 @@ def test_expiry_catchup_revokes_and_notifies(base_config_dict, mock_pipeline_con
         action._catchup_expiry()
 
         mock_revoke.assert_called_once()
+        # record_revocation is now called with the full GrantRecord, not just the URN
         mock_record_rev.assert_called_once_with(
-            mock_revoke.call_args[0][0],
-            "urn:li:actionRequest:expired-001",
+            mock_revoke.call_args[0][0],  # conn
+            expired,  # GrantRecord
             action.config.state,
         )
         mock_notify.assert_called_once()

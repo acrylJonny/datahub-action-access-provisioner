@@ -136,21 +136,78 @@ make test          # pytest
 Set `provisioning.dry_run: true` in the config to log all GRANT/REVOKE
 statements without executing them. Email notifications are still sent.
 
+## Extension and re-request workflows
+
+### How do users extend access before it expires?
+
+Submit a **new form request** through the same DataHub workflow. Each submission
+creates a new `ActionRequest` entity with a unique URN. The provisioner handles it
+transparently:
+
+```
+User submits Request B (same role/database/schema, longer duration)
+        │
+        ▼
+Approved → AccessProvisionerAction._provision(Request B)
+        │
+        ├─ is_already_provisioned("request-b-urn") → False  ← new URN
+        │
+        ├─ GRANT statements execute (idempotent — Snowflake silently accepts
+        │  re-GRANTs for privileges the role already holds)
+        │
+        └─ record_grant(Request B)
+               MERGE on (SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA)
+               ┌── row exists (from Request A) → UPDATE EXPIRES_AT + LATEST_URN
+               └── row not exist              → INSERT
+```
+
+The grants table is keyed on `(SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA)`,
+not on the request URN. This means:
+
+- There is always **exactly one active row** per access combination.
+- The extension MERGE replaces the old expiry timer with the new one.
+- The expiry monitor uses the updated `EXPIRES_AT` — it will **not** fire on the
+  old timer and revoke still-valid access.
+
+### What about re-requesting after access has been revoked?
+
+Same flow: submit a new request. When the provisioner processes the approved
+re-request, the MERGE finds the row with `REVOKED_AT IS NOT NULL`, clears
+`REVOKED_AT`, re-GRANTs the Snowflake privileges, and updates the expiry.
+
+### Do I need a separate "extension" workflow in DataHub?
+
+No — the same access-request workflow works for both initial requests and
+extensions. If you want approvers to see that this is a renewal rather than a
+fresh request, you can add a form field (e.g. `request_type: "extension"`) and
+include it in the justification email. No code changes are required.
+
 ## Architecture notes
 
-### Grant registry
+### Grant state table
 
-Active grants are stored in-memory in the action instance. This means revocations
-survive only for the lifetime of the running action process. For production use
-with high availability requirements, replace `self._active_grants` with a
-persistent store (e.g. a Snowflake table or Redis).
+All active grants are tracked in `ACCESS_PROVISIONER_GRANTS` in Snowflake,
+keyed on `(SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA)`. This natural
+key ensures one active row per access combination and makes extension requests
+safe — a MERGE on the natural key updates the expiry in place rather than
+creating a duplicate row that would trigger premature revocation.
 
-### SLA email deduplication
+`SNOWFLAKE_SCHEMA` stores an empty string `''` as a sentinel for "all schemas"
+because Snowflake composite PKs do not permit NULL components.
 
-The `_sla_notified` dict tracks which thresholds have been notified per request
-so that reminders are not re-sent on every poll cycle. This state is also
-in-memory and resets on restart — acceptable for most deployments, since DataHub
-will still emit the MCL event on the next status change.
+### SLA deduplication
+
+Sent SLA notifications are tracked in `ACCESS_PROVISIONER_SLA_NOTIFICATIONS`,
+keyed on `(ACTION_REQUEST_URN, NOTIFICATION_TYPE)`. Each warning/escalation
+fires at most once per request across all scheduled runs.
+
+### Scheduled invocation
+
+Because the DataHub executor kills actions after ~5 minutes of idle time, this
+action should be run on a schedule (every 30 minutes is recommended). On each
+startup the action runs a full catchup pass — fetching recent approved requests
+and checking for expired grants and SLA breaches — before entering the live
+event-listening window.
 
 ### Snowflake user requirements
 

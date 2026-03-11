@@ -156,7 +156,7 @@ class AccessProvisionerAction(Action):
             )
             try:
                 revoke_access(conn, grant, self.config.provisioning)
-                record_revocation(conn, grant.action_request_urn, self.config.state)
+                record_revocation(conn, grant, self.config.state)
             except Exception as exc:
                 logger.error(
                     f"[Expiry] Failed to revoke {grant.action_request_urn}: {exc}",
