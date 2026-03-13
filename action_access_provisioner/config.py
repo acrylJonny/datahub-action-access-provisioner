@@ -13,9 +13,14 @@ class SnowflakeConnectionConfig(BaseModel):
 
     account_id: str = Field(description="Snowflake account identifier (e.g. xy12345.us-east-1)")
     username: str = Field(description="Snowflake username")
-    password: str = Field(description="Snowflake password")
+    password: Optional[str] = Field(
+        default=None, description="Snowflake password (username/password auth)"
+    )
     warehouse: Optional[str] = Field(default=None, description="Default warehouse to use")
-    role: str = Field(description="Snowflake role — must have GRANT OPTION on target objects")
+    role: Optional[str] = Field(
+        default=None,
+        description="Snowflake role — must have GRANT OPTION on target objects",
+    )
     authentication_type: str = Field(
         default="DEFAULT_AUTHENTICATOR",
         description="Snowflake authentication type (DEFAULT_AUTHENTICATOR or KEY_PAIR_AUTHENTICATOR)",
@@ -28,9 +33,11 @@ class SnowflakeConnectionConfig(BaseModel):
         kwargs: dict = {
             "account": self.account_id,
             "user": self.username,
-            "password": self.password,
-            "role": self.role,
         }
+        if self.password:
+            kwargs["password"] = self.password
+        if self.role:
+            kwargs["role"] = self.role
         if self.warehouse:
             kwargs["warehouse"] = self.warehouse
         return snowflake.connector.connect(**kwargs)
