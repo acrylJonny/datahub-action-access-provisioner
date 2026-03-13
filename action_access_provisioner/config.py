@@ -2,10 +2,38 @@
 
 from typing import Optional
 
-from datahub.ingestion.source.snowflake.snowflake_connection import (
-    SnowflakeConnectionConfig,
-)
 from pydantic import BaseModel, Field
+
+
+class SnowflakeConnectionConfig(BaseModel):
+    """Snowflake connection parameters.
+
+    Uses snowflake-connector-python directly — no SQLAlchemy required.
+    """
+
+    account_id: str = Field(description="Snowflake account identifier (e.g. xy12345.us-east-1)")
+    username: str = Field(description="Snowflake username")
+    password: str = Field(description="Snowflake password")
+    warehouse: Optional[str] = Field(default=None, description="Default warehouse to use")
+    role: str = Field(description="Snowflake role — must have GRANT OPTION on target objects")
+    authentication_type: str = Field(
+        default="DEFAULT_AUTHENTICATOR",
+        description="Snowflake authentication type (DEFAULT_AUTHENTICATOR or KEY_PAIR_AUTHENTICATOR)",
+    )
+
+    def get_native_connection(self):  # type: ignore[return]
+        """Return a live snowflake.connector connection."""
+        import snowflake.connector  # lazy import — not needed at config-parse time
+
+        kwargs: dict = {
+            "account": self.account_id,
+            "user": self.username,
+            "password": self.password,
+            "role": self.role,
+        }
+        if self.warehouse:
+            kwargs["warehouse"] = self.warehouse
+        return snowflake.connector.connect(**kwargs)
 
 
 class SmtpConfig(BaseModel):

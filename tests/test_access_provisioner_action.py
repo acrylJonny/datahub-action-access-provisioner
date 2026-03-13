@@ -48,6 +48,7 @@ def base_config_dict():
             "username": "test-user",
             "password": "test-password",
             "warehouse": "TEST_WH",
+            "role": "SYSADMIN",
             "authentication_type": "DEFAULT_AUTHENTICATOR",
         },
         "state": {
