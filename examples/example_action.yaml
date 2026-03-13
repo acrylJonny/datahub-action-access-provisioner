@@ -2,6 +2,17 @@
 #
 # Author: Jonny Dixon
 #
+# TWO RUN MODES
+# -------------
+# 1. DataHub Cloud (managed) — recommended for production.
+#    Register the action with DataHub Cloud using the RemoteActionSource format
+#    (see "DataHub Cloud deployment" section below).  The Cloud executor manages
+#    scheduling and restarts; the action runs every 30 minutes automatically.
+#
+# 2. Local / self-hosted — for development and testing.
+#    Use `source.type: "datahub-cloud"` and run with:
+#      datahub actions -c examples/example_action.yaml
+#
 # SCHEDULING NOTE
 # ---------------
 # The DataHub Cloud executor kills actions after ~5 minutes of idle time.
@@ -17,96 +28,121 @@
 #        - Sends SLA reminders for pending requests (deduped via state table)
 #   2. Listens for live events for the remaining ~5-minute window
 #
-# Recommended scheduling: every 30 minutes via cron or your DataHub scheduler.
-# Example cron: */30 * * * * datahub actions -c /path/to/example_action.yaml
+# =============================================================================
+# DATAHUB CLOUD DEPLOYMENT (recommended)
+# =============================================================================
+# When deploying as a managed action in DataHub Cloud, use the RemoteActionSource.
+# The action config moves inside `source.config.action_spec` and is registered
+# with a stable URN so DataHub Cloud can schedule and track it.
 
 name: access-provisioner
 
 source:
-  type: "datahub-cloud"
+  type: datahub_integrations.sources.remote_actions.remote_action_source.RemoteActionSource
   config:
-    # Allow the full idle window before the executor shuts down the action.
-    # Set to false so the process stays alive during the 5-min window for live events.
-    kill_after_idle_timeout: false
+    action_urn: "urn:li:dataHubAction:access-provisioner"
+    stage: live
+    action_spec:
+      type: "action-access-provisioner"
+      config:
+        # ----------------------------------------------------------------
+        # Snowflake connection (executes GRANT / REVOKE statements)
+        # ----------------------------------------------------------------
+        snowflake_connection:
+          account_id: "xy12345"              # e.g. xy12345.us-east-1
+          username: "datahub_provisioner"
+          password: "${SNOWFLAKE_PASSWORD}"
+          warehouse: "COMPUTE_WH"
+          role: "SYSADMIN"                   # Must have GRANT OPTION privilege
+          authentication_type: "DEFAULT_AUTHENTICATOR"
 
-action:
-  type: "action-access-provisioner"
-  config:
-    # ----------------------------------------------------------------
-    # Snowflake connection (executes GRANT / REVOKE statements)
-    # ----------------------------------------------------------------
-    snowflake_connection:
-      account_id: "xy12345"              # e.g. xy12345.us-east-1
-      username: "datahub_provisioner"
-      password: "${SNOWFLAKE_PASSWORD}"
-      warehouse: "COMPUTE_WH"
-      role: "SYSADMIN"                   # Must have GRANT OPTION privilege
-      authentication_type: "DEFAULT_AUTHENTICATOR"
+        # ----------------------------------------------------------------
+        # Persistent state tables
+        # Tracks provisioned grants and sent notifications across runs.
+        # The schema must already exist; the tables are created on first run.
+        # ----------------------------------------------------------------
+        state:
+          database: "DATAHUB"
+          schema: "ACCESS_PROVISIONER"
+          grants_table: "ACCESS_PROVISIONER_GRANTS"          # default
+          sla_table: "ACCESS_PROVISIONER_SLA_NOTIFICATIONS"  # default
 
-    # ----------------------------------------------------------------
-    # Persistent state tables
-    # Tracks provisioned grants and sent notifications across runs.
-    # The schema must already exist; the tables are created on first run.
-    # ----------------------------------------------------------------
-    state:
-      database: "DATAHUB"
-      schema: "ACCESS_PROVISIONER"
-      grants_table: "ACCESS_PROVISIONER_GRANTS"          # default
-      sla_table: "ACCESS_PROVISIONER_SLA_NOTIFICATIONS"  # default
+        # ----------------------------------------------------------------
+        # Gmail SMTP (outbound email notifications)
+        # ----------------------------------------------------------------
+        smtp:
+          host: "smtp.gmail.com"
+          port: 587
+          username: "datahub-noreply@yourdomain.com"
+          password: "${GMAIL_APP_PASSWORD}"   # Google App Password
+          from_address: "DataHub Access Bot <datahub-noreply@yourdomain.com>"
+          use_tls: true
 
-    # ----------------------------------------------------------------
-    # Gmail SMTP (outbound email notifications)
-    # ----------------------------------------------------------------
-    smtp:
-      host: "smtp.gmail.com"
-      port: 587
-      username: "datahub-noreply@yourdomain.com"
-      password: "${GMAIL_APP_PASSWORD}"   # Google App Password
-      from_address: "DataHub Access Bot <datahub-noreply@yourdomain.com>"
-      use_tls: true
+        # ----------------------------------------------------------------
+        # SLA monitoring
+        # Each threshold fires at most once per request (deduped in state table).
+        # ----------------------------------------------------------------
+        sla:
+          warning_after_hours: 24            # Send reminder after 24 h
+          escalation_after_hours: 72         # Escalate after 72 h
+          escalation_recipients:             # CC'd on escalation emails
+            - "data-governance@yourdomain.com"
 
-    # ----------------------------------------------------------------
-    # SLA monitoring
-    # Each threshold fires at most once per request (deduped in state table).
-    # ----------------------------------------------------------------
-    sla:
-      warning_after_hours: 24            # Send reminder after 24 h
-      escalation_after_hours: 72         # Escalate after 72 h
-      escalation_recipients:             # CC'd on escalation emails
-        - "data-governance@yourdomain.com"
+        # ----------------------------------------------------------------
+        # Access expiry / auto-revocation
+        # ----------------------------------------------------------------
+        expiry:
+          enabled: true
+          revocation_notification: true      # Email requestor on revocation
 
-    # ----------------------------------------------------------------
-    # Access expiry / auto-revocation
-    # ----------------------------------------------------------------
-    expiry:
-      enabled: true
-      revocation_notification: true      # Email requestor on revocation
+        # ----------------------------------------------------------------
+        # Snowflake provisioning options
+        # ----------------------------------------------------------------
+        provisioning:
+          default_warehouse: "COMPUTE_WH"    # Granted alongside database access
+          dry_run: false                     # Set true to test without executing
 
-    # ----------------------------------------------------------------
-    # Snowflake provisioning options
-    # ----------------------------------------------------------------
-    provisioning:
-      default_warehouse: "COMPUTE_WH"    # Granted alongside database access
-      dry_run: false                     # Set true to test without executing
+        # ----------------------------------------------------------------
+        # Catchup window — how far back to scan DataHub for approved requests
+        # on each startup pass. Requests outside this window are assumed
+        # already handled. 90 days is a safe default.
+        # ----------------------------------------------------------------
+        lookback_days: 90
 
-    # ----------------------------------------------------------------
-    # Catchup window — how far back to scan DataHub for approved requests
-    # on each startup pass. Requests outside this window are assumed
-    # already handled. 90 days is a safe default.
-    # ----------------------------------------------------------------
-    lookback_days: 90
-
-    # ----------------------------------------------------------------
-    # Workflow form field IDs
-    # Must match the `id` values defined in your DataHub workflow form.
-    # ----------------------------------------------------------------
-    field_snowflake_database: "snowflake_database"
-    field_snowflake_schema: "snowflake_schema"
-    field_snowflake_role: "snowflake_role"
-    field_access_duration_days: "access_duration_days"
-    field_requestor_email: "requestor_email"
-    field_justification: "justification"
+        # ----------------------------------------------------------------
+        # Workflow form field IDs
+        # Must match the `id` values defined in your DataHub workflow form.
+        # ----------------------------------------------------------------
+        field_snowflake_database: "snowflake_database"
+        field_snowflake_schema: "snowflake_schema"
+        field_snowflake_role: "snowflake_role"
+        field_access_duration_days: "access_duration_days"
+        field_requestor_email: "requestor_email"
+        field_justification: "justification"
 
 datahub:
-  server: "https://your-datahub-instance.acryl.io"
+  server: "https://your-datahub-instance.acryl.io/gms"
   token: "${DATAHUB_TOKEN}"
+
+# =============================================================================
+# LOCAL / SELF-HOSTED (development and testing)
+# =============================================================================
+# To test locally against a DataHub Cloud instance, replace the source block
+# above with the following and run:
+#   datahub actions -c examples/example_action.yaml
+#
+# name: access-provisioner
+#
+# source:
+#   type: "datahub-cloud"
+#   config:
+#     kill_after_idle_timeout: false
+#
+# action:
+#   type: "action-access-provisioner"
+#   config:
+#     <same config block as action_spec.config above>
+#
+# datahub:
+#   server: "https://your-datahub-instance.acryl.io/gms"
+#   token: "${DATAHUB_TOKEN}"

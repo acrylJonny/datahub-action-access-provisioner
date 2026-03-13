@@ -67,7 +67,43 @@ pip install datahub-action-access-provisioner
 See [`examples/example_action.yaml`](examples/example_action.yaml) for a
 fully-annotated configuration file.
 
-### Minimal example
+### DataHub Cloud (managed) — recommended
+
+Register the action with DataHub Cloud using the `RemoteActionSource`. The Cloud
+executor manages scheduling and restarts; there is no `action:` top-level key —
+the action type and config move inside `source.config.action_spec`.
+
+```yaml
+name: access-provisioner
+source:
+  type: datahub_integrations.sources.remote_actions.remote_action_source.RemoteActionSource
+  config:
+    action_urn: "urn:li:dataHubAction:access-provisioner"
+    stage: live
+    action_spec:
+      type: "action-access-provisioner"
+      config:
+        snowflake_connection:
+          account_id: "xy12345"          # e.g. xy12345.us-east-1
+          username: "datahub_provisioner"
+          password: "${SNOWFLAKE_PASSWORD}"
+          warehouse: "COMPUTE_WH"
+          role: "SYSADMIN"               # Must have GRANT OPTION privilege
+        smtp:
+          host: "smtp.gmail.com"
+          port: 587
+          username: "noreply@yourdomain.com"
+          password: "${GMAIL_APP_PASSWORD}"
+          use_tls: true
+datahub:
+  server: "https://your-datahub-instance.acryl.io/gms"
+  token: "${DATAHUB_TOKEN}"
+```
+
+### Local / self-hosted (development and testing)
+
+For local testing against a DataHub Cloud instance, use the `datahub-cloud` source
+and run with `datahub actions -c`:
 
 ```yaml
 name: access-provisioner
@@ -82,12 +118,16 @@ action:
       account_id: "xy12345"
       username: "datahub_provisioner"
       password: "${SNOWFLAKE_PASSWORD}"
+      warehouse: "COMPUTE_WH"
       role: "SYSADMIN"
     smtp:
+      host: "smtp.gmail.com"
+      port: 587
       username: "noreply@yourdomain.com"
       password: "${GMAIL_APP_PASSWORD}"
+      use_tls: true
 datahub:
-  server: "https://your-datahub.acryl.io"
+  server: "https://your-datahub-instance.acryl.io/gms"
   token: "${DATAHUB_TOKEN}"
 ```
 
@@ -110,6 +150,8 @@ See [`examples/example_workflow_form_fields.md`](examples/example_workflow_form_
 for the exact SQL that will be executed for different combinations.
 
 ## Running Locally
+
+Use the local (`datahub-cloud` source) configuration from the minimal example above.
 
 ```bash
 # Set required env vars

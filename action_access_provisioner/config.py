@@ -37,11 +37,19 @@ class StateConfig(BaseModel):
     Because the DataHub executor kills the action after ~5 minutes of idle time,
     all state that must survive across scheduled invocations is stored here rather
     than in memory.
+
+    Defaults to DATAHUB.ACCESS_PROVISIONER — override if the schema does not exist
+    or you prefer a different location.
     """
 
-    database: str = Field(description="Snowflake database that holds the state tables")
+    database: str = Field(
+        default="DATAHUB",
+        description="Snowflake database that holds the state tables",
+    )
     schema_name: str = Field(
-        description="Snowflake schema that holds the state tables", alias="schema"
+        default="ACCESS_PROVISIONER",
+        description="Snowflake schema that holds the state tables",
+        alias="schema",
     )
     grants_table: str = Field(
         default="ACCESS_PROVISIONER_GRANTS",
@@ -111,10 +119,11 @@ class AccessProvisionerConfig(BaseModel):
         description="Snowflake connection used to execute GRANT/REVOKE statements"
     )
     state: StateConfig = Field(
+        default_factory=StateConfig,
         description=(
             "Snowflake database/schema/table names used to persist grant state and SLA "
-            "notifications across scheduled runs"
-        )
+            "notifications across scheduled runs. Defaults to DATAHUB.ACCESS_PROVISIONER."
+        ),
     )
     smtp: SmtpConfig = Field(description="Gmail SMTP configuration for email notifications")
     sla: SlaConfig = Field(
