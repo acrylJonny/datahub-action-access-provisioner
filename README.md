@@ -100,6 +100,16 @@ datahub:
   token: "${DATAHUB_TOKEN}"
 ```
 
+When creating the ingestion source in the DataHub Cloud UI, go to **Step 5 → Advanced**
+and add the following under **Extra Pip Libraries**:
+
+```json
+["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.3/datahub_action_access_provisioner-0.1.3-py3-none-any.whl"]
+```
+
+Update the wheel URL to point to the [latest release](https://github.com/acrylJonny/datahub-action-access-provisioner/releases)
+when a new version is published.
+
 ### Local / self-hosted (development and testing)
 
 For local testing against a DataHub Cloud instance, use the `datahub-cloud` source
@@ -245,8 +255,8 @@ fires at most once per request across all scheduled runs.
 
 ### Scheduled invocation
 
-Because the DataHub executor kills actions after ~5 minutes of idle time, this
-action should be run on a schedule (every 30 minutes is recommended). On each
+Because the DataHub executor kills actions after ~30 seconds of idle time, this
+action should be run on a schedule (every 5–10 minutes is recommended). On each
 startup the action runs a full catchup pass — fetching recent approved requests
 and checking for expired grants and SLA breaches — before entering the live
 event-listening window.
