@@ -25,6 +25,14 @@ class SnowflakeConnectionConfig(BaseModel):
         default="DEFAULT_AUTHENTICATOR",
         description="Snowflake authentication type (DEFAULT_AUTHENTICATOR or KEY_PAIR_AUTHENTICATOR)",
     )
+    private_key: Optional[str] = Field(
+        default=None,
+        description="PEM-encoded RSA private key for key-pair authentication",
+    )
+    private_key_password: Optional[str] = Field(
+        default=None,
+        description="Passphrase for the encrypted private key (if applicable)",
+    )
 
     def get_native_connection(self):  # type: ignore[return]
         """Return a live snowflake.connector connection."""
@@ -34,12 +42,28 @@ class SnowflakeConnectionConfig(BaseModel):
             "account": self.account_id,
             "user": self.username,
         }
-        if self.password:
-            kwargs["password"] = self.password
         if self.role:
             kwargs["role"] = self.role
         if self.warehouse:
             kwargs["warehouse"] = self.warehouse
+
+        if self.authentication_type == "KEY_PAIR_AUTHENTICATOR":
+            from cryptography.hazmat.backends import default_backend
+            from cryptography.hazmat.primitives import serialization
+
+            passphrase = self.private_key_password.encode() if self.private_key_password else None
+            pem = (self.private_key or "").encode()
+            p_key = serialization.load_pem_private_key(
+                pem, password=passphrase, backend=default_backend()
+            )
+            kwargs["private_key"] = p_key.private_bytes(
+                encoding=serialization.Encoding.DER,
+                format=serialization.PrivateFormat.PKCS8,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        elif self.password:
+            kwargs["password"] = self.password
+
         return snowflake.connector.connect(**kwargs)
 
 
