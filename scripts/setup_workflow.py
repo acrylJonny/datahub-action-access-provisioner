@@ -71,6 +71,7 @@ import json
 import logging
 import os
 import sys
+from typing import Any, cast
 
 import requests
 
@@ -95,7 +96,7 @@ mutation upsertActionWorkflow($input: UpsertActionWorkflowInput!) {
 # ---------------------------------------------------------------------------
 
 
-def _graphql(gms_url: str, token: str, query: str, variables: dict) -> dict:
+def _graphql(gms_url: str, token: str, query: str, variables: dict) -> Any:
     url = gms_url.rstrip("/") + "/api/graphql"
     resp = requests.post(
         url,
@@ -123,7 +124,7 @@ def _upsert_workflow(
         log.info("DRY RUN — mutation variables:\n%s", json.dumps(variables, indent=2))
         return None
     data = _graphql(gms_url, token, _UPSERT_WORKFLOW_MUTATION, variables)
-    urn = data["upsertActionWorkflow"]["urn"]
+    urn = cast(str, data["upsertActionWorkflow"]["urn"])
     log.info("  Created/updated workflow: %s", urn)
     return urn
 

@@ -2,6 +2,7 @@
 
 import logging
 import time
+from typing import Any
 
 from pydantic import ValidationError
 
@@ -21,17 +22,18 @@ from action_access_provisioner.models import (
 logger = logging.getLogger(__name__)
 
 
-def _execute_graphql(graph: object, query: str, variables: dict) -> dict:
+def _execute_graphql(graph: object, query: str, variables: dict) -> Any:
     """Execute a GraphQL query against DataHub.
 
     Works with both DataHubGraph (which has execute_graphql directly) and
     AcrylDataHubGraph (which wraps a DataHubGraph in .graph).
+    Returns Any because execute_graphql is untyped in the DataHub SDK.
     """
     if hasattr(graph, "execute_graphql"):
-        return graph.execute_graphql(query, variables=variables)  # type: ignore[union-attr]
+        return graph.execute_graphql(query, variables=variables)
     # AcrylDataHubGraph — delegate to the inner DataHubGraph
     if hasattr(graph, "graph") and hasattr(graph.graph, "execute_graphql"):
-        return graph.graph.execute_graphql(query, variables=variables)  # type: ignore[union-attr]
+        return graph.graph.execute_graphql(query, variables=variables)
     raise AttributeError(
         f"Graph object {type(graph)} has no execute_graphql method. Cannot execute GraphQL query."
     )

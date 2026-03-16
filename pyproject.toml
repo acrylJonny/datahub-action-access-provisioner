@@ -32,6 +32,7 @@ dev = [
     "pytest-cov>=4.0.0",
     "pytest-mock>=3.10.0",
     "types-PyYAML",
+    "types-requests",
     "freezegun>=1.2.0",
 ]
 

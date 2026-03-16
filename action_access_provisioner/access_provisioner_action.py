@@ -188,7 +188,7 @@ class AccessProvisionerAction(Action):
         if event.event_type != "MetadataChangeLogEvent_v1":
             return
 
-        mcl: MetadataChangeLogEvent = event.event  # type: ignore[assignment]
+        mcl: MetadataChangeLogEvent = event.event
         if getattr(mcl, "entityType", None) != "actionRequest":
             return
         if getattr(mcl, "aspectName", None) != _ASPECT_ACTION_REQUEST_STATUS:

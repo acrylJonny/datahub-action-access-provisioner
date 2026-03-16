@@ -41,7 +41,7 @@ def _num_field(field_id: str, value: float) -> dict:
 
 
 def _make_action_request_dict(
-    status: str = REQUEST_STATUS_COMPLETED, result: str = REQUEST_RESULT_APPROVED
+    status: str = REQUEST_STATUS_COMPLETED, result: str | None = REQUEST_RESULT_APPROVED
 ) -> dict:
     """Build a raw dict matching the GraphQL ActionRequest shape."""
     return {

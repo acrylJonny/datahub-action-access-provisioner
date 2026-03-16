@@ -1,6 +1,5 @@
 """Configuration models for the access provisioner action."""
 
-
 from pydantic import BaseModel, Field
 
 
@@ -33,7 +32,7 @@ class SnowflakeConnectionConfig(BaseModel):
         description="Passphrase for the encrypted private key (if applicable)",
     )
 
-    def get_native_connection(self):  # type: ignore[return]
+    def get_native_connection(self):
         """Return a live snowflake.connector connection."""
         import snowflake.connector  # lazy import — not needed at config-parse time
 

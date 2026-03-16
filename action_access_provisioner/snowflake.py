@@ -4,6 +4,7 @@ import logging
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
+from typing import Any
 
 from action_access_provisioner.config import (
     SnowflakeConnectionConfig,
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 
 @contextmanager
-def _cursor(conn) -> Generator:  # type: ignore[type-arg]
+def _cursor(conn) -> Generator[Any, None, None]:
     cur = conn.cursor()
     try:
         yield cur
@@ -24,7 +25,7 @@ def _cursor(conn) -> Generator:  # type: ignore[type-arg]
         cur.close()
 
 
-def get_connection(connection_config: SnowflakeConnectionConfig):  # type: ignore[return]
+def get_connection(connection_config: SnowflakeConnectionConfig):
     """Create and return a Snowflake connection from the provided config."""
     return connection_config.get_native_connection()
 
