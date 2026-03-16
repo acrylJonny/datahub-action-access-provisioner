@@ -33,19 +33,55 @@ def _execute_graphql(graph, query: str, variables: dict) -> dict:
     )
 
 
-# GraphQL query to fetch a single action request by URN
+# Note: ActionRequest does NOT implement Entity, so searchAcrossEntities cannot be used.
+# The listActionRequests query (ListActionRequestsInput) is the correct API.
+# All fields are top-level — there is no actionRequestInfo / actionRequestStatus wrapper.
+
+# Fetch a single ActionRequest by URN
 _FETCH_ACTION_REQUEST_QUERY = """
 query fetchActionRequest($urn: String!) {
   actionRequest(urn: $urn) {
     urn
-    actionRequestInfo {
+    type
+    status
+    result
+    resultNote
+    entity { urn }
+    assignedUsers
+    assignedGroups
+    created { time actor { urn } }
+    dueDate
+    params {
+      workflowFormRequest {
+        fields {
+          id
+          values {
+            ... on StringValue { stringValue }
+            ... on NumberValue { numberValue }
+          }
+        }
+        access { expiresAt }
+      }
+    }
+  }
+}
+"""
+
+# List ActionRequests with server-side type/status filtering
+_LIST_ACTION_REQUESTS_QUERY = """
+query listActionRequests($input: ListActionRequestsInput!) {
+  listActionRequests(input: $input) {
+    total
+    actionRequests {
+      urn
       type
-      resource
-      resourceType
-      assignedUsers { urn }
-      assignedGroups { urn }
-      created
-      createdBy { urn }
+      status
+      result
+      resultNote
+      entity { urn }
+      assignedUsers
+      assignedGroups
+      created { time actor { urn } }
       dueDate
       params {
         workflowFormRequest {
@@ -57,109 +93,6 @@ query fetchActionRequest($urn: String!) {
             }
           }
           access { expiresAt }
-        }
-      }
-    }
-    actionRequestStatus {
-      status
-      result
-      note
-    }
-  }
-}
-"""
-
-# Shared fragment for workflow form request fields (reused by multiple queries)
-_WORKFLOW_FORM_FRAGMENT = """
-fragment WorkflowFormFields on ActionRequest {
-  urn
-  actionRequestInfo {
-    type
-    resource
-    created
-    createdBy { urn }
-    assignedUsers { urn }
-    assignedGroups { urn }
-    params {
-      workflowFormRequest {
-        fields {
-          id
-          values {
-            ... on StringValue { stringValue }
-            ... on NumberValue { numberValue }
-          }
-        }
-      }
-    }
-  }
-  actionRequestStatus { status result }
-}
-"""
-
-# GraphQL search query for COMPLETED/APPROVED access requests within a time window
-_SEARCH_APPROVED_REQUESTS_QUERY = """
-query searchApprovedRequests($input: SearchAcrossEntitiesInput!) {
-  searchAcrossEntities(input: $input) {
-    total
-    searchResults {
-      entity {
-        urn
-        ... on ActionRequest {
-          actionRequestInfo {
-            type
-            resource
-            created
-            createdBy { urn }
-            params {
-              workflowFormRequest {
-                fields {
-                  id
-                  values {
-                    ... on StringValue { stringValue }
-                    ... on NumberValue { numberValue }
-                  }
-                }
-                access { expiresAt }
-              }
-            }
-          }
-          actionRequestStatus { status result note }
-        }
-      }
-    }
-  }
-}
-"""
-
-# GraphQL search query for PENDING access requests
-_SEARCH_PENDING_REQUESTS_QUERY = """
-query searchPendingRequests($input: SearchAcrossEntitiesInput!) {
-  searchAcrossEntities(input: $input) {
-    total
-    searchResults {
-      entity {
-        urn
-        ... on ActionRequest {
-          actionRequestInfo {
-            type
-            resource
-            created
-            createdBy { urn }
-            assignedUsers { urn }
-            assignedGroups { urn }
-            params {
-              workflowFormRequest {
-                fields {
-                  id
-                  values {
-                    ... on StringValue { stringValue }
-                    ... on NumberValue { numberValue }
-                  }
-                }
-              }
-            }
-          }
-          actionRequestStatus { status result }
         }
       }
     }
@@ -213,6 +146,29 @@ def _parse_form_fields(
     )
 
 
+def _parse_action_request_node(
+    node: dict[str, Any],
+    config_field_ids: dict[str, str],
+) -> AccessRequest:
+    """Parse an ActionRequest node returned by listActionRequests or actionRequest queries."""
+    created = node.get("created") or {}
+    fields_raw = (node.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
+    form_fields = _parse_form_fields(fields_raw, config_field_ids)
+
+    return AccessRequest(
+        urn=node.get("urn", ""),
+        status=node.get("status", ""),
+        result=node.get("result"),
+        note=node.get("resultNote"),
+        request_type=node.get("type", ""),
+        resource=(node.get("entity") or {}).get("urn"),
+        requestor_urn=(created.get("actor") or {}).get("urn"),
+        created_ms=created.get("time"),
+        due_date_ms=node.get("dueDate"),
+        form_fields=form_fields,
+    )
+
+
 def fetch_action_request(
     graph,
     urn: str,
@@ -242,59 +198,41 @@ def fetch_pending_action_requests(
     config_field_ids: dict[str, str],
     batch_size: int = 100,
 ) -> list[PendingRequestSummary]:
-    """Search DataHub for all PENDING workflow access requests."""
+    """List all PENDING workflow access requests from DataHub."""
     variables = {
         "input": {
-            "types": ["ACTION_REQUEST"],
-            "query": "*",
             "start": 0,
             "count": batch_size,
-            "orFilters": [
-                {
-                    "and": [
-                        {
-                            "field": "status",
-                            "condition": "EQUAL",
-                            "value": REQUEST_STATUS_PENDING,
-                        },
-                        {
-                            "field": "type",
-                            "condition": "EQUAL",
-                            "value": ACTION_REQUEST_TYPE_WORKFLOW,
-                        },
-                    ]
-                }
-            ],
+            "type": ACTION_REQUEST_TYPE_WORKFLOW,
+            "status": REQUEST_STATUS_PENDING,
+            "allActionRequests": True,
         }
     }
 
     try:
-        result = _execute_graphql(graph, _SEARCH_PENDING_REQUESTS_QUERY, variables=variables)
+        result = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
     except Exception as exc:
-        logger.error(f"GraphQL error searching pending requests: {exc}")
+        logger.error(f"GraphQL error fetching pending requests: {exc}")
         return []
 
-    search_results = (result or {}).get("searchAcrossEntities", {}).get("searchResults", [])
+    action_requests = (result or {}).get("listActionRequests", {}).get("actionRequests", [])
 
     pending: list[PendingRequestSummary] = []
-    for item in search_results:
-        entity = item.get("entity", {})
-        info = entity.get("actionRequestInfo", {})
-        if not info:
-            continue
-
-        fields_raw = (info.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
+    for node in action_requests:
+        created = node.get("created") or {}
+        fields_raw = (node.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
         form_fields = _parse_form_fields(fields_raw, config_field_ids)
 
         pending.append(
             PendingRequestSummary(
-                urn=entity.get("urn", ""),
-                created_ms=info.get("created") or 0,
-                requestor_urn=(info.get("createdBy") or {}).get("urn"),
+                urn=node.get("urn", ""),
+                created_ms=created.get("time") or 0,
+                requestor_urn=(created.get("actor") or {}).get("urn"),
                 requestor_email=form_fields.requestor_email,
-                resource=info.get("resource"),
-                assigned_users=[u.get("urn", "") for u in (info.get("assignedUsers") or [])],
-                assigned_groups=[g.get("urn", "") for g in (info.get("assignedGroups") or [])],
+                resource=(node.get("entity") or {}).get("urn"),
+                # assignedUsers / assignedGroups are [String!] scalars in this schema version
+                assigned_users=node.get("assignedUsers") or [],
+                assigned_groups=node.get("assignedGroups") or [],
             )
         )
 
@@ -308,96 +246,48 @@ def fetch_all_approved_requests(
     batch_size: int = 100,
 ) -> list[AccessRequest]:
     """
-    Return all COMPLETED/APPROVED workflow access requests created within the lookback window.
+    Return all COMPLETED/ACCEPTED workflow access requests created within the lookback window.
 
-    This is called on startup to catch up on any requests that were approved while the action
-    was not running. The caller is responsible for filtering out requests that have already
-    been provisioned (using the Snowflake state table).
+    Uses listActionRequests with status=COMPLETED and allActionRequests=True, then
+    post-filters by result=ACCEPTED and the time window in Python. This avoids relying on
+    the result field being indexed for server-side filtering.
     """
     since_ms = int((time.time() - lookback_days * 86_400) * 1000)
     approved: list[AccessRequest] = []
     start = 0
 
     while True:
-        # Keep the search simple: only filter by status and type (both are reliably indexed).
-        # result=APPROVED and the time window are applied in Python below — filtering by
-        # `result` inside the search variables is unreliable because the field is not always
-        # indexed, and mixing `filters` + `orFilters` can silently return zero results.
         variables = {
             "input": {
-                "types": ["ACTION_REQUEST"],
-                "query": "*",
                 "start": start,
                 "count": batch_size,
-                "orFilters": [
-                    {
-                        "and": [
-                            {
-                                "field": "status",
-                                "condition": "EQUAL",
-                                "value": REQUEST_STATUS_COMPLETED,
-                            },
-                            {
-                                "field": "type",
-                                "condition": "EQUAL",
-                                "value": ACTION_REQUEST_TYPE_WORKFLOW,
-                            },
-                        ]
-                    }
-                ],
+                "type": ACTION_REQUEST_TYPE_WORKFLOW,
+                "status": REQUEST_STATUS_COMPLETED,
+                "allActionRequests": True,
             }
         }
 
         try:
-            result = _execute_graphql(graph, _SEARCH_APPROVED_REQUESTS_QUERY, variables=variables)
+            result = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
         except Exception as exc:
             logger.error(f"GraphQL error fetching approved requests (start={start}): {exc}")
             break
 
-        data = (result or {}).get("searchAcrossEntities", {})
-        search_results = data.get("searchResults", [])
+        data = (result or {}).get("listActionRequests", {})
+        action_requests = data.get("actionRequests", [])
         total = data.get("total", 0)
 
-        for item in search_results:
-            entity = item.get("entity", {})
-            if not entity:
-                continue
-            node = _parse_action_request_node(entity, config_field_ids)
-            # Post-filter: only WORKFLOW_FORM_REQUEST requests that are APPROVED and within window
-            if (
-                node.request_type == ACTION_REQUEST_TYPE_WORKFLOW
-                and node.result == REQUEST_RESULT_APPROVED
-                and (node.created_ms is None or node.created_ms >= since_ms)
+        for node in action_requests:
+            ar = _parse_action_request_node(node, config_field_ids)
+            # Post-filter: only ACCEPTED results within the lookback window
+            if ar.result == REQUEST_RESULT_APPROVED and (
+                ar.created_ms is None or ar.created_ms >= since_ms
             ):
-                approved.append(node)
+                approved.append(ar)
 
-        start += len(search_results)
-        if start >= total or not search_results:
+        start += len(action_requests)
+        if start >= total or not action_requests:
             break
 
     logger.info(f"[GraphQL] Found {len(approved)} approved requests in last {lookback_days} days")
     return approved
-
-
-def _parse_action_request_node(
-    node: dict[str, Any],
-    config_field_ids: dict[str, str],
-) -> AccessRequest:
-    info = node.get("actionRequestInfo", {})
-    status_obj = node.get("actionRequestStatus", {})
-
-    fields_raw = (info.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
-    form_fields = _parse_form_fields(fields_raw, config_field_ids)
-
-    return AccessRequest(
-        urn=node.get("urn", ""),
-        status=status_obj.get("status", ""),
-        result=status_obj.get("result"),
-        note=status_obj.get("note"),
-        request_type=info.get("type", ""),
-        resource=info.get("resource"),
-        requestor_urn=(info.get("createdBy") or {}).get("urn"),
-        created_ms=info.get("created"),
-        due_date_ms=info.get("dueDate"),
-        form_fields=form_fields,
-    )

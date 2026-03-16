@@ -70,7 +70,7 @@ def approved_request():
     return AccessRequest(
         urn="urn:li:actionRequest:approved-001",
         status="COMPLETED",
-        result="APPROVED",
+        result="ACCEPTED",
         note="Looks good",
         request_type="WORKFLOW_FORM_REQUEST",
         resource="urn:li:dataset:(urn:li:dataPlatform:snowflake,PROD.SALES.ORDERS,PROD)",
@@ -93,7 +93,7 @@ def denied_request():
     return AccessRequest(
         urn="urn:li:actionRequest:denied-001",
         status="COMPLETED",
-        result="DENIED",
+        result="REJECTED",
         note="Policy does not permit this",
         request_type="WORKFLOW_FORM_REQUEST",
         resource="urn:li:dataset:(urn:li:dataPlatform:snowflake,PROD.HR.EMPLOYEES,PROD)",

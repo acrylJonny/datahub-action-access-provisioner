@@ -99,29 +99,30 @@ def test_parse_form_fields_invalid_duration_falls_back_to_none(field_id_map):
 
 
 def _make_graph_response(status: str, result: str):
+    # Matches the actual DataHub GraphQL schema: ActionRequest fields are top-level,
+    # no actionRequestInfo / actionRequestStatus wrappers.
     return {
         "actionRequest": {
             "urn": "urn:li:actionRequest:001",
-            "actionRequestInfo": {
-                "type": "WORKFLOW_FORM_REQUEST",
-                "resource": "urn:li:dataset:foo",
-                "assignedUsers": [{"urn": "urn:li:corpuser:approver"}],
-                "assignedGroups": [],
-                "created": 1700000000000,
-                "createdBy": {"urn": "urn:li:corpuser:requester"},
-                "dueDate": None,
-                "params": {
-                    "workflowFormRequest": {
-                        "fields": [
-                            _make_field("snowflake_database", "PROD"),
-                            _make_field("snowflake_role", "ANALYST"),
-                            _make_field("requestor_email", "req@example.com"),
-                        ],
-                        "access": None,
-                    }
-                },
+            "type": "WORKFLOW_FORM_REQUEST",
+            "status": status,
+            "result": result,
+            "resultNote": None,
+            "entity": {"urn": "urn:li:dataset:foo"},
+            "assignedUsers": ["urn:li:corpuser:approver"],
+            "assignedGroups": [],
+            "created": {"time": 1700000000000, "actor": {"urn": "urn:li:corpuser:requester"}},
+            "dueDate": None,
+            "params": {
+                "workflowFormRequest": {
+                    "fields": [
+                        _make_field("snowflake_database", "PROD"),
+                        _make_field("snowflake_role", "ANALYST"),
+                        _make_field("requestor_email", "req@example.com"),
+                    ],
+                    "access": None,
+                }
             },
-            "actionRequestStatus": {"status": status, "result": result, "note": None},
         }
     }
 
