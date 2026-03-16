@@ -249,9 +249,21 @@ def fetch_pending_action_requests(
             "query": "*",
             "start": 0,
             "count": batch_size,
-            "filters": [
-                {"field": "status", "value": REQUEST_STATUS_PENDING},
-                {"field": "type", "value": ACTION_REQUEST_TYPE_WORKFLOW},
+            "orFilters": [
+                {
+                    "and": [
+                        {
+                            "field": "status",
+                            "condition": "EQUAL",
+                            "value": REQUEST_STATUS_PENDING,
+                        },
+                        {
+                            "field": "type",
+                            "condition": "EQUAL",
+                            "value": ACTION_REQUEST_TYPE_WORKFLOW,
+                        },
+                    ]
+                }
             ],
         }
     }
@@ -307,26 +319,29 @@ def fetch_all_approved_requests(
     start = 0
 
     while True:
+        # Keep the search simple: only filter by status and type (both are reliably indexed).
+        # result=APPROVED and the time window are applied in Python below — filtering by
+        # `result` inside the search variables is unreliable because the field is not always
+        # indexed, and mixing `filters` + `orFilters` can silently return zero results.
         variables = {
             "input": {
                 "types": ["ACTION_REQUEST"],
                 "query": "*",
                 "start": start,
                 "count": batch_size,
-                "filters": [
-                    {"field": "status", "value": REQUEST_STATUS_COMPLETED},
-                    {"field": "result", "value": REQUEST_RESULT_APPROVED},
-                    {"field": "type", "value": ACTION_REQUEST_TYPE_WORKFLOW},
-                ],
-                # Filter by creation time so old handled requests don't pile up
                 "orFilters": [
                     {
                         "and": [
                             {
-                                "field": "created",
-                                "condition": "GREATER_THAN_OR_EQUAL_TO",
-                                "value": str(since_ms),
-                            }
+                                "field": "status",
+                                "condition": "EQUAL",
+                                "value": REQUEST_STATUS_COMPLETED,
+                            },
+                            {
+                                "field": "type",
+                                "condition": "EQUAL",
+                                "value": ACTION_REQUEST_TYPE_WORKFLOW,
+                            },
                         ]
                     }
                 ],
@@ -348,7 +363,12 @@ def fetch_all_approved_requests(
             if not entity:
                 continue
             node = _parse_action_request_node(entity, config_field_ids)
-            if node.request_type == ACTION_REQUEST_TYPE_WORKFLOW:
+            # Post-filter: only WORKFLOW_FORM_REQUEST requests that are APPROVED and within window
+            if (
+                node.request_type == ACTION_REQUEST_TYPE_WORKFLOW
+                and node.result == REQUEST_RESULT_APPROVED
+                and (node.created_ms is None or node.created_ms >= since_ms)
+            ):
                 approved.append(node)
 
         start += len(search_results)
