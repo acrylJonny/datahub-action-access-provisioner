@@ -4,7 +4,6 @@ import logging
 from collections.abc import Generator
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Optional
 
 from action_access_provisioner.config import (
     SnowflakeConnectionConfig,
@@ -132,8 +131,8 @@ def provision_access(
     conn,
     role: str,
     database: str,
-    schema: Optional[str],
-    warehouse: Optional[str],
+    schema: str | None,
+    warehouse: str | None,
     provisioning: SnowflakeProvisioningConfig,
 ) -> list[str]:
     """

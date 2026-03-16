@@ -7,8 +7,6 @@ Conversion methods (to_access_request, to_pending_summary) translate the API
 response into the domain models defined in models.py.
 """
 
-from __future__ import annotations
-
 import logging
 
 from pydantic import BaseModel, Field

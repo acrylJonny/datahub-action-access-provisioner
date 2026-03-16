@@ -7,7 +7,7 @@ name = "datahub-action-access-provisioner"
 version = "0.1.8"
 description = "DataHub Action to provision Snowflake access and send email notifications on workflow approval"
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.10"
 license = "Apache-2.0"
 authors = [
     {name = "Jonny Dixon"}
@@ -40,7 +40,7 @@ action-access-provisioner = "action_access_provisioner.access_provisioner_action
 
 [tool.ruff]
 line-length = 100
-target-version = "py39"
+target-version = "py310"
 
 [tool.ruff.lint]
 select = [
@@ -59,7 +59,7 @@ ignore = [
 known-first-party = ["action_access_provisioner"]
 
 [tool.mypy]
-python_version = "3.9"
+python_version = "3.10"
 warn_return_any = true
 warn_unused_configs = true
 disallow_untyped_defs = false

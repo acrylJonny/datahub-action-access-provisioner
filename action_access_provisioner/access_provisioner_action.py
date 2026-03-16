@@ -22,7 +22,7 @@ so it persists across invocations and prevents duplicate actions.
 
 import logging
 import time
-from typing import Any, Optional
+from typing import Any
 
 from datahub_actions.action.action import Action
 from datahub_actions.event.event_envelope import EventEnvelope
@@ -266,7 +266,7 @@ class AccessProvisionerAction(Action):
             return
 
         # Persist grant to Snowflake state table
-        expires_at_ms: Optional[int] = None
+        expires_at_ms: int | None = None
         if ff.access_duration_days:
             expires_at_ms = int(time.time() * 1000) + ff.access_duration_days * 86_400_000
 

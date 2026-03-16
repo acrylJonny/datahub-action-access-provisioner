@@ -1,7 +1,6 @@
 """Data models for access request state."""
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 # Status values emitted by DataHub on actionRequestStatus
 REQUEST_STATUS_PENDING = "PENDING"
@@ -19,12 +18,12 @@ ACTION_REQUEST_TYPE_WORKFLOW = "WORKFLOW_FORM_REQUEST"
 class FormFieldValues:
     """Extracted values from an ActionWorkflowFormRequest's fields list."""
 
-    snowflake_database: Optional[str] = None
-    snowflake_schema: Optional[str] = None
-    snowflake_role: Optional[str] = None
-    access_duration_days: Optional[int] = None
-    requestor_email: Optional[str] = None
-    justification: Optional[str] = None
+    snowflake_database: str | None = None
+    snowflake_schema: str | None = None
+    snowflake_role: str | None = None
+    access_duration_days: int | None = None
+    requestor_email: str | None = None
+    justification: str | None = None
 
     # Raw field map in case callers want non-standard fields
     raw: dict[str, str] = field(default_factory=dict)
@@ -36,15 +35,15 @@ class AccessRequest:
 
     urn: str
     status: str
-    result: Optional[str]
-    note: Optional[str]
+    result: str | None
+    note: str | None
 
     # From actionRequestInfo
     request_type: str
-    resource: Optional[str]
-    requestor_urn: Optional[str]
-    created_ms: Optional[int]
-    due_date_ms: Optional[int]
+    resource: str | None
+    requestor_urn: str | None
+    created_ms: int | None
+    due_date_ms: int | None
 
     # Parsed form fields
     form_fields: FormFieldValues
@@ -69,10 +68,10 @@ class GrantRecord:
     action_request_urn: str
     snowflake_role: str
     snowflake_database: str
-    snowflake_schema: Optional[str]
-    requestor_email: Optional[str]
+    snowflake_schema: str | None
+    requestor_email: str | None
     granted_at_ms: int
-    expires_at_ms: Optional[int]
+    expires_at_ms: int | None
 
     @property
     def has_expiry(self) -> bool:
@@ -85,8 +84,8 @@ class PendingRequestSummary:
 
     urn: str
     created_ms: int
-    requestor_urn: Optional[str]
-    requestor_email: Optional[str]
-    resource: Optional[str]
+    requestor_urn: str | None
+    requestor_email: str | None
+    resource: str | None
     assigned_users: list[str] = field(default_factory=list)
     assigned_groups: list[str] = field(default_factory=list)

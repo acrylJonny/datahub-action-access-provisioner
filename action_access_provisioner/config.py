@@ -1,6 +1,5 @@
 """Configuration models for the access provisioner action."""
 
-from typing import Optional
 
 from pydantic import BaseModel, Field
 
@@ -13,11 +12,11 @@ class SnowflakeConnectionConfig(BaseModel):
 
     account_id: str = Field(description="Snowflake account identifier (e.g. xy12345.us-east-1)")
     username: str = Field(description="Snowflake username")
-    password: Optional[str] = Field(
+    password: str | None = Field(
         default=None, description="Snowflake password (username/password auth)"
     )
-    warehouse: Optional[str] = Field(default=None, description="Default warehouse to use")
-    role: Optional[str] = Field(
+    warehouse: str | None = Field(default=None, description="Default warehouse to use")
+    role: str | None = Field(
         default=None,
         description="Snowflake role — must have GRANT OPTION on target objects",
     )
@@ -25,11 +24,11 @@ class SnowflakeConnectionConfig(BaseModel):
         default="DEFAULT_AUTHENTICATOR",
         description="Snowflake authentication type (DEFAULT_AUTHENTICATOR or KEY_PAIR_AUTHENTICATOR)",
     )
-    private_key: Optional[str] = Field(
+    private_key: str | None = Field(
         default=None,
         description="PEM-encoded RSA private key for key-pair authentication",
     )
-    private_key_password: Optional[str] = Field(
+    private_key_password: str | None = Field(
         default=None,
         description="Passphrase for the encrypted private key (if applicable)",
     )
@@ -76,7 +75,7 @@ class SmtpConfig(BaseModel):
     password: str = Field(
         description="Gmail App Password (generate at myaccount.google.com/apppasswords)"
     )
-    from_address: Optional[str] = Field(
+    from_address: str | None = Field(
         default=None,
         description="Sender display address — defaults to username if not set",
     )
@@ -161,7 +160,7 @@ class ExpiryConfig(BaseModel):
 class SnowflakeProvisioningConfig(BaseModel):
     """Controls how Snowflake GRANT statements are constructed."""
 
-    default_warehouse: Optional[str] = Field(
+    default_warehouse: str | None = Field(
         default=None,
         description="Warehouse to grant USAGE on when granting database/schema access",
     )

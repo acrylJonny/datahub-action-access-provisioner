@@ -5,7 +5,6 @@ import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Optional
 
 from action_access_provisioner.config import SmtpConfig
 from action_access_provisioner.models import AccessRequest, GrantRecord
@@ -18,7 +17,7 @@ def _send(
     to_addresses: list[str],
     subject: str,
     html_body: str,
-    cc_addresses: Optional[list[str]] = None,
+    cc_addresses: list[str] | None = None,
 ) -> None:
     """Send an HTML email via Gmail SMTP."""
     if not to_addresses:
@@ -134,10 +133,10 @@ def send_denial_notification(
 def send_sla_warning(
     smtp_config: SmtpConfig,
     action_request_urn: str,
-    resource: Optional[str],
+    resource: str | None,
     pending_hours: float,
     assignee_emails: list[str],
-    datahub_url: Optional[str] = None,
+    datahub_url: str | None = None,
 ) -> None:
     """Remind approvers that a request has been pending longer than the SLA threshold."""
     subject = f"⚠️ Action required: access request pending for {pending_hours:.0f}h"
@@ -163,11 +162,11 @@ def send_sla_warning(
 def send_escalation_alert(
     smtp_config: SmtpConfig,
     action_request_urn: str,
-    resource: Optional[str],
+    resource: str | None,
     pending_hours: float,
     assignee_emails: list[str],
     escalation_recipients: list[str],
-    datahub_url: Optional[str] = None,
+    datahub_url: str | None = None,
 ) -> None:
     """Send escalation email when SLA has been significantly breached."""
     subject = (
