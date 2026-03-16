@@ -16,6 +16,23 @@ from .models import (
 
 logger = logging.getLogger(__name__)
 
+
+def _execute_graphql(graph, query: str, variables: dict) -> dict:
+    """Execute a GraphQL query against DataHub.
+
+    Works with both DataHubGraph (which has execute_graphql directly) and
+    AcrylDataHubGraph (which wraps a DataHubGraph in .graph).
+    """
+    if hasattr(graph, "execute_graphql"):
+        return graph.execute_graphql(query, variables=variables)
+    # AcrylDataHubGraph — delegate to the inner DataHubGraph
+    if hasattr(graph, "graph") and hasattr(graph.graph, "execute_graphql"):
+        return graph.graph.execute_graphql(query, variables=variables)
+    raise AttributeError(
+        f"Graph object {type(graph)} has no execute_graphql method. Cannot execute GraphQL query."
+    )
+
+
 # GraphQL query to fetch a single action request by URN
 _FETCH_ACTION_REQUEST_QUERY = """
 query fetchActionRequest($urn: String!) {
@@ -203,7 +220,8 @@ def fetch_action_request(
 ) -> Optional[AccessRequest]:
     """Fetch and parse a single ActionRequest by URN using the DataHub graph client."""
     try:
-        result = graph.execute_graphql(
+        result = _execute_graphql(
+            graph,
             _FETCH_ACTION_REQUEST_QUERY,
             variables={"urn": urn},
         )
@@ -239,7 +257,7 @@ def fetch_pending_action_requests(
     }
 
     try:
-        result = graph.execute_graphql(_SEARCH_PENDING_REQUESTS_QUERY, variables=variables)
+        result = _execute_graphql(graph, _SEARCH_PENDING_REQUESTS_QUERY, variables=variables)
     except Exception as exc:
         logger.error(f"GraphQL error searching pending requests: {exc}")
         return []
@@ -316,7 +334,7 @@ def fetch_all_approved_requests(
         }
 
         try:
-            result = graph.execute_graphql(_SEARCH_APPROVED_REQUESTS_QUERY, variables=variables)
+            result = _execute_graphql(graph, _SEARCH_APPROVED_REQUESTS_QUERY, variables=variables)
         except Exception as exc:
             logger.error(f"GraphQL error fetching approved requests (start={start}): {exc}")
             break
