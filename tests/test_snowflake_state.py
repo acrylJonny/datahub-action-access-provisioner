@@ -120,9 +120,25 @@ def test_record_grant_without_expiry_uses_null(mock_conn, state_config, grant_no
     conn, cursor = mock_conn
     record_grant(conn, grant_no_expiry, state_config)
     cursor.execute.assert_called_once()
-    sql = cursor.execute.call_args[0][0]
+    sql, params = cursor.execute.call_args[0]
     # EXPIRES_AT expressions should be NULL literals, not a placeholder
     assert "NULL" in sql
+    # Param count must equal the number of %s placeholders:
+    # 3 (USING) + 3 (MATCHED SET) + 6 (NOT MATCHED VALUES) = 12
+    assert sql.count("%s") == len(params), (
+        f"Param mismatch: {sql.count('%s')} placeholders but {len(params)} params"
+    )
+
+
+def test_record_grant_with_expiry_param_count(mock_conn, state_config, grant_with_expiry):
+    conn, cursor = mock_conn
+    record_grant(conn, grant_with_expiry, state_config)
+    cursor.execute.assert_called_once()
+    sql, params = cursor.execute.call_args[0]
+    # With expiry: 3 (USING) + 4 (MATCHED SET incl. expires) + 7 (NOT MATCHED incl. expires) = 14
+    assert sql.count("%s") == len(params), (
+        f"Param mismatch: {sql.count('%s')} placeholders but {len(params)} params"
+    )
 
 
 def test_record_grant_schema_none_uses_sentinel(mock_conn, state_config, grant_no_expiry):

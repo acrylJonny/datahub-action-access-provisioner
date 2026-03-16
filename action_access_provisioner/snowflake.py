@@ -346,10 +346,9 @@ def record_grant(conn, grant: GrantRecord, state: StateConfig) -> None:
              LATEST_ACTION_REQUEST_URN, REQUESTOR_EMAIL, GRANTED_AT, EXPIRES_AT)
         VALUES (%s, %s, %s, %s, %s, %s::TIMESTAMP_NTZ, {expires_expr})
     """
+    # WHEN MATCHED SET params: URN, email, granted_at (+ optional expires).
+    # role/db/schema are NOT included here — they belong only in the USING clause.
     common = [
-        grant.snowflake_role,
-        grant.snowflake_database,
-        schema_key,
         grant.action_request_urn,
         grant.requestor_email,
         granted_str,
