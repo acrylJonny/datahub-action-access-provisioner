@@ -29,26 +29,26 @@ from datahub_actions.event.event_envelope import EventEnvelope
 from datahub_actions.event.event_registry import MetadataChangeLogEvent
 from datahub_actions.pipeline.pipeline_context import PipelineContext
 
-from .config import AccessProvisionerConfig
-from .email import (
+from action_access_provisioner.config import AccessProvisionerConfig
+from action_access_provisioner.email import (
     send_approval_notification,
     send_denial_notification,
     send_escalation_alert,
     send_revocation_notification,
     send_sla_warning,
 )
-from .graphql import (
+from action_access_provisioner.graphql import (
     fetch_action_request,
     fetch_all_approved_requests,
     fetch_pending_action_requests,
 )
-from .models import (
+from action_access_provisioner.models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
     AccessRequest,
     GrantRecord,
     PendingRequestSummary,
 )
-from .snowflake import (
+from action_access_provisioner.snowflake import (
     ensure_state_tables,
     get_connection,
     get_expired_grants,

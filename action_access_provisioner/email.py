@@ -7,8 +7,8 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import Optional
 
-from .config import SmtpConfig
-from .models import AccessRequest, GrantRecord
+from action_access_provisioner.config import SmtpConfig
+from action_access_provisioner.models import AccessRequest, GrantRecord
 
 logger = logging.getLogger(__name__)
 

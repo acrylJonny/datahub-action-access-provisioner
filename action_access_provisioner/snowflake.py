@@ -6,8 +6,12 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from typing import Optional
 
-from .config import SnowflakeConnectionConfig, SnowflakeProvisioningConfig, StateConfig
-from .models import GrantRecord
+from action_access_provisioner.config import (
+    SnowflakeConnectionConfig,
+    SnowflakeProvisioningConfig,
+    StateConfig,
+)
+from action_access_provisioner.models import GrantRecord
 
 logger = logging.getLogger(__name__)
 

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datahub-action-access-provisioner"
-version = "0.1.7"
+version = "0.1.8"
 description = "DataHub Action to provision Snowflake access and send email notifications on workflow approval"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -14,6 +14,7 @@ authors = [
 ]
 dependencies = [
     "snowflake-connector-python>=3.0.0,<5.0.0",
+    "pydantic>=2.0.0",
 ]
 
 [tool.setuptools.packages.find]
@@ -25,7 +26,6 @@ exclude = ["tests*"]
 dev = [
     "acryl-datahub-actions>=1.0.0",
     "acryl-datahub>=1.0.0",
-    "pydantic>=2.0.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "pytest>=7.0.0",

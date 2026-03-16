@@ -1,33 +1,39 @@
 """DataHub GraphQL helpers for querying access requests."""
 
+from __future__ import annotations
+
 import logging
 import time
-from typing import Any, Optional
 
-from .models import (
+from pydantic import ValidationError
+
+from action_access_provisioner.gql_types import (
+    GqlFetchActionRequestData,
+    GqlListActionRequestsData,
+)
+from action_access_provisioner.models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
     REQUEST_RESULT_APPROVED,
     REQUEST_STATUS_COMPLETED,
     REQUEST_STATUS_PENDING,
     AccessRequest,
-    FormFieldValues,
     PendingRequestSummary,
 )
 
 logger = logging.getLogger(__name__)
 
 
-def _execute_graphql(graph, query: str, variables: dict) -> dict:
+def _execute_graphql(graph: object, query: str, variables: dict) -> dict:
     """Execute a GraphQL query against DataHub.
 
     Works with both DataHubGraph (which has execute_graphql directly) and
     AcrylDataHubGraph (which wraps a DataHubGraph in .graph).
     """
     if hasattr(graph, "execute_graphql"):
-        return graph.execute_graphql(query, variables=variables)
+        return graph.execute_graphql(query, variables=variables)  # type: ignore[union-attr]
     # AcrylDataHubGraph — delegate to the inner DataHubGraph
     if hasattr(graph, "graph") and hasattr(graph.graph, "execute_graphql"):
-        return graph.graph.execute_graphql(query, variables=variables)
+        return graph.graph.execute_graphql(query, variables=variables)  # type: ignore[union-attr]
     raise AttributeError(
         f"Graph object {type(graph)} has no execute_graphql method. Cannot execute GraphQL query."
     )
@@ -101,100 +107,33 @@ query listActionRequests($input: ListActionRequestsInput!) {
 """
 
 
-def _extract_field_value(values: list[dict[str, Any]]) -> Optional[str]:
-    """Return the first primitive value from a form field's values list."""
-    for v in values:
-        if "stringValue" in v:
-            return v["stringValue"]
-        if "numberValue" in v:
-            return str(v["numberValue"])
-    return None
-
-
-def _parse_form_fields(
-    raw_fields: list[dict[str, Any]],
-    config_field_ids: dict[str, str],
-) -> FormFieldValues:
-    """Map raw GraphQL field list into a FormFieldValues dataclass."""
-    raw: dict[str, str] = {}
-    for f in raw_fields:
-        field_id = f.get("id", "")
-        val = _extract_field_value(f.get("values", []))
-        if val is not None:
-            raw[field_id] = val
-
-    def _get(config_key: str) -> Optional[str]:
-        form_field_id = config_field_ids.get(config_key)
-        return raw.get(form_field_id) if form_field_id else None
-
-    duration_str = _get("field_access_duration_days")
-    duration_int: Optional[int] = None
-    if duration_str is not None:
-        try:
-            duration_int = int(float(duration_str))
-        except ValueError:
-            logger.warning(f"Could not parse access_duration_days value: '{duration_str}'")
-
-    return FormFieldValues(
-        snowflake_database=_get("field_snowflake_database"),
-        snowflake_schema=_get("field_snowflake_schema"),
-        snowflake_role=_get("field_snowflake_role"),
-        access_duration_days=duration_int,
-        requestor_email=_get("field_requestor_email"),
-        justification=_get("field_justification"),
-        raw=raw,
-    )
-
-
-def _parse_action_request_node(
-    node: dict[str, Any],
-    config_field_ids: dict[str, str],
-) -> AccessRequest:
-    """Parse an ActionRequest node returned by listActionRequests or actionRequest queries."""
-    created = node.get("created") or {}
-    fields_raw = (node.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
-    form_fields = _parse_form_fields(fields_raw, config_field_ids)
-
-    return AccessRequest(
-        urn=node.get("urn", ""),
-        status=node.get("status", ""),
-        result=node.get("result"),
-        note=node.get("resultNote"),
-        request_type=node.get("type", ""),
-        resource=(node.get("entity") or {}).get("urn"),
-        requestor_urn=(created.get("actor") or {}).get("urn"),
-        created_ms=created.get("time"),
-        due_date_ms=node.get("dueDate"),
-        form_fields=form_fields,
-    )
-
-
 def fetch_action_request(
-    graph,
+    graph: object,
     urn: str,
     config_field_ids: dict[str, str],
-) -> Optional[AccessRequest]:
-    """Fetch and parse a single ActionRequest by URN using the DataHub graph client."""
+) -> AccessRequest | None:
+    """Fetch and parse a single ActionRequest by URN."""
     try:
-        result = _execute_graphql(
-            graph,
-            _FETCH_ACTION_REQUEST_QUERY,
-            variables={"urn": urn},
-        )
+        raw = _execute_graphql(graph, _FETCH_ACTION_REQUEST_QUERY, variables={"urn": urn})
     except Exception as exc:
         logger.error(f"GraphQL error fetching action request {urn}: {exc}")
         return None
 
-    node = (result or {}).get("actionRequest")
-    if not node:
+    try:
+        data = GqlFetchActionRequestData.model_validate(raw or {})
+    except ValidationError as exc:
+        logger.error(f"Failed to parse actionRequest response for {urn}: {exc}")
+        return None
+
+    if not data.actionRequest:
         logger.warning(f"No actionRequest found for URN {urn}")
         return None
 
-    return _parse_action_request_node(node, config_field_ids)
+    return data.actionRequest.to_access_request(config_field_ids)
 
 
 def fetch_pending_action_requests(
-    graph,
+    graph: object,
     config_field_ids: dict[str, str],
     batch_size: int = 100,
 ) -> list[PendingRequestSummary]:
@@ -210,47 +149,33 @@ def fetch_pending_action_requests(
     }
 
     try:
-        result = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
+        raw = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
     except Exception as exc:
         logger.error(f"GraphQL error fetching pending requests: {exc}")
         return []
 
-    action_requests = (result or {}).get("listActionRequests", {}).get("actionRequests", [])
+    try:
+        data = GqlListActionRequestsData.model_validate(raw or {})
+    except ValidationError as exc:
+        logger.error(f"Failed to parse listActionRequests response: {exc}")
+        return []
 
-    pending: list[PendingRequestSummary] = []
-    for node in action_requests:
-        created = node.get("created") or {}
-        fields_raw = (node.get("params") or {}).get("workflowFormRequest", {}).get("fields", [])
-        form_fields = _parse_form_fields(fields_raw, config_field_ids)
-
-        pending.append(
-            PendingRequestSummary(
-                urn=node.get("urn", ""),
-                created_ms=created.get("time") or 0,
-                requestor_urn=(created.get("actor") or {}).get("urn"),
-                requestor_email=form_fields.requestor_email,
-                resource=(node.get("entity") or {}).get("urn"),
-                # assignedUsers / assignedGroups are [String!] scalars in this schema version
-                assigned_users=node.get("assignedUsers") or [],
-                assigned_groups=node.get("assignedGroups") or [],
-            )
-        )
-
-    return pending
+    return [
+        ar.to_pending_summary(config_field_ids) for ar in data.listActionRequests.actionRequests
+    ]
 
 
 def fetch_all_approved_requests(
-    graph,
+    graph: object,
     config_field_ids: dict[str, str],
     lookback_days: int = 90,
     batch_size: int = 100,
 ) -> list[AccessRequest]:
-    """
-    Return all COMPLETED/ACCEPTED workflow access requests created within the lookback window.
+    """Return all COMPLETED/ACCEPTED workflow access requests within the lookback window.
 
     Uses listActionRequests with status=COMPLETED and allActionRequests=True, then
-    post-filters by result=ACCEPTED and the time window in Python. This avoids relying on
-    the result field being indexed for server-side filtering.
+    post-filters by result=ACCEPTED and the time window in Python. This avoids relying
+    on the result field being indexed for server-side filtering.
     """
     since_ms = int((time.time() - lookback_days * 86_400) * 1000)
     approved: list[AccessRequest] = []
@@ -268,25 +193,27 @@ def fetch_all_approved_requests(
         }
 
         try:
-            result = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
+            raw = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
         except Exception as exc:
             logger.error(f"GraphQL error fetching approved requests (start={start}): {exc}")
             break
 
-        data = (result or {}).get("listActionRequests", {})
-        action_requests = data.get("actionRequests", [])
-        total = data.get("total", 0)
+        try:
+            data = GqlListActionRequestsData.model_validate(raw or {})
+        except ValidationError as exc:
+            logger.error(f"Failed to parse listActionRequests response (start={start}): {exc}")
+            break
 
-        for node in action_requests:
-            ar = _parse_action_request_node(node, config_field_ids)
+        result = data.listActionRequests
+        for ar in result.actionRequests:
             # Post-filter: only ACCEPTED results within the lookback window
             if ar.result == REQUEST_RESULT_APPROVED and (
-                ar.created_ms is None or ar.created_ms >= since_ms
+                ar.created.time is None or ar.created.time >= since_ms
             ):
-                approved.append(ar)
+                approved.append(ar.to_access_request(config_field_ids))
 
-        start += len(action_requests)
-        if start >= total or not action_requests:
+        start += len(result.actionRequests)
+        if start >= result.total or not result.actionRequests:
             break
 
     logger.info(f"[GraphQL] Found {len(approved)} approved requests in last {lookback_days} days")
