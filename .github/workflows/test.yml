@@ -33,8 +33,7 @@ jobs:
         run: ruff format --check .
 
       - name: Type check with mypy
-        run: mypy action_access_provisioner/
-        continue-on-error: true
+        run: mypy .
 
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=action_access_provisioner --cov-report=term-missing
