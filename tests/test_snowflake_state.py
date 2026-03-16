@@ -13,8 +13,11 @@ from action_access_provisioner.snowflake import (
     ensure_state_tables,
     get_expired_grants,
     is_already_provisioned,
+    is_permanent_snowflake_error,
+    is_provisioning_failed,
     is_sla_notified,
     record_grant,
+    record_provisioning_error,
     record_revocation,
     record_sla_notification,
 )
@@ -69,10 +72,11 @@ def grant_no_expiry():
 def test_ensure_state_tables_creates_both_tables(mock_conn, state_config):
     conn, cursor = mock_conn
     ensure_state_tables(conn, state_config)
-    assert cursor.execute.call_count == 2
+    assert cursor.execute.call_count == 3
     stmts = [c[0][0] for c in cursor.execute.call_args_list]
     assert any("ACCESS_PROVISIONER_GRANTS" in s for s in stmts)
     assert any("ACCESS_PROVISIONER_SLA_NOTIFICATIONS" in s for s in stmts)
+    assert any("ACCESS_PROVISIONER_ERRORS" in s for s in stmts)
 
 
 # ---------------------------------------------------------------------------
@@ -273,3 +277,78 @@ def test_record_sla_notification_inserts(mock_conn, state_config):
     sql = cursor.execute.call_args[0][0]
     assert "INSERT INTO" in sql
     assert "ACCESS_PROVISIONER_SLA_NOTIFICATIONS" in sql
+
+
+# ---------------------------------------------------------------------------
+# Permanent provisioning error tracking
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_state_tables_creates_errors_table(mock_conn, state_config):
+    conn, cursor = mock_conn
+    ensure_state_tables(conn, state_config)
+    sqls = [call[0][0] for call in cursor.execute.call_args_list]
+    assert any("ACCESS_PROVISIONER_ERRORS" in s for s in sqls)
+
+
+def test_is_provisioning_failed_true(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (1,)
+    assert is_provisioning_failed(conn, "urn:li:actionRequest:010", state_config) is True
+
+
+def test_is_provisioning_failed_false(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (0,)
+    assert is_provisioning_failed(conn, "urn:li:actionRequest:011", state_config) is False
+
+
+def test_record_provisioning_error_inserts(mock_conn, state_config):
+    conn, cursor = mock_conn
+    record_provisioning_error(
+        conn, "urn:li:actionRequest:012", "2003", "Role 'X' does not exist", state_config
+    )
+    cursor.execute.assert_called_once()
+    sql, params = cursor.execute.call_args[0]
+    assert "INSERT INTO" in sql
+    assert "ACCESS_PROVISIONER_ERRORS" in sql
+    assert params[0] == "urn:li:actionRequest:012"
+    assert params[1] == "2003"
+    assert "does not exist" in params[2]
+
+
+def test_record_provisioning_error_is_idempotent(mock_conn, state_config):
+    """Second call for the same URN must not raise — the WHERE NOT EXISTS guards it."""
+    conn, cursor = mock_conn
+    record_provisioning_error(conn, "urn:li:actionRequest:013", None, "error", state_config)
+    record_provisioning_error(conn, "urn:li:actionRequest:013", None, "error", state_config)
+    assert cursor.execute.call_count == 2  # two calls, but Snowflake ignores duplicates
+
+
+# ---------------------------------------------------------------------------
+# is_permanent_snowflake_error
+# ---------------------------------------------------------------------------
+
+
+def test_is_permanent_snowflake_error_true_for_002003():
+    try:
+        from snowflake.connector.errors import ProgrammingError
+
+        exc = ProgrammingError(msg="Role 'X' does not exist or not authorized", errno=2003)
+        assert is_permanent_snowflake_error(exc) is True
+    except ImportError:
+        pytest.skip("snowflake-connector-python not installed")
+
+
+def test_is_permanent_snowflake_error_false_for_other_errno():
+    try:
+        from snowflake.connector.errors import ProgrammingError
+
+        exc = ProgrammingError(msg="Some other error", errno=90001)
+        assert is_permanent_snowflake_error(exc) is False
+    except ImportError:
+        pytest.skip("snowflake-connector-python not installed")
+
+
+def test_is_permanent_snowflake_error_false_for_plain_exception():
+    assert is_permanent_snowflake_error(ValueError("boom")) is False

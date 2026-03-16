@@ -34,6 +34,7 @@ from action_access_provisioner.email import (
     send_approval_notification,
     send_denial_notification,
     send_escalation_alert,
+    send_provisioning_failure_notification,
     send_revocation_notification,
     send_sla_warning,
 )
@@ -54,9 +55,12 @@ from action_access_provisioner.snowflake import (
     get_expired_grants,
     get_user_default_role,
     is_already_provisioned,
+    is_permanent_snowflake_error,
+    is_provisioning_failed,
     is_sla_notified,
     provision_access,
     record_grant,
+    record_provisioning_error,
     record_revocation,
     record_sla_notification,
     revoke_access,
@@ -139,6 +143,11 @@ class AccessProvisionerAction(Action):
         for request in approved:
             if is_already_provisioned(conn, request.urn, self.config.state):
                 logger.debug(f"[Catchup] {request.urn} already provisioned — skipping")
+                continue
+            if is_provisioning_failed(conn, request.urn, self.config.state):
+                logger.debug(
+                    f"[Catchup] {request.urn} has a permanent provisioning failure — skipping"
+                )
                 continue
             self._provision(request)
             new_count += 1
@@ -264,6 +273,23 @@ class AccessProvisionerAction(Action):
             )
         except Exception as exc:
             logger.error(f"[Provision] Snowflake error for {request.urn}: {exc}", exc_info=True)
+            if is_permanent_snowflake_error(exc):
+                error_code = str(getattr(exc, "errno", "")) or None
+                error_msg = str(exc)
+                try:
+                    record_provisioning_error(
+                        conn, request.urn, error_code, error_msg, self.config.state
+                    )
+                except Exception as rec_exc:
+                    logger.error(
+                        f"[Provision] Failed to record error state for {request.urn}: {rec_exc}"
+                    )
+                try:
+                    send_provisioning_failure_notification(self.config.smtp, request, error_msg)
+                except Exception as mail_exc:
+                    logger.error(
+                        f"[Provision] Failed to send failure notification for {request.urn}: {mail_exc}"
+                    )
             return
 
         # Persist grant to Snowflake state table

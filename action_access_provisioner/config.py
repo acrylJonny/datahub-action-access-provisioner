@@ -116,6 +116,13 @@ class StateConfig(BaseModel):
         default="ACCESS_PROVISIONER_SLA_NOTIFICATIONS",
         description="Table tracking sent SLA notifications (prevents duplicate emails across runs)",
     )
+    errors_table: str = Field(
+        default="ACCESS_PROVISIONER_ERRORS",
+        description=(
+            "Table recording permanently-failed provisioning attempts (e.g. role does not exist). "
+            "Requests recorded here are skipped on future catchup passes to prevent infinite retries."
+        ),
+    )
 
     @property
     def qualified_grants_table(self) -> str:
@@ -124,6 +131,10 @@ class StateConfig(BaseModel):
     @property
     def qualified_sla_table(self) -> str:
         return f"{self.database}.{self.schema_name}.{self.sla_table}"
+
+    @property
+    def qualified_errors_table(self) -> str:
+        return f"{self.database}.{self.schema_name}.{self.errors_table}"
 
 
 class SlaConfig(BaseModel):

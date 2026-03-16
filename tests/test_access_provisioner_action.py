@@ -178,6 +178,10 @@ def test_catchup_approved_provisions_new_requests(
             "action_access_provisioner.access_provisioner_action.is_already_provisioned",
             return_value=False,
         ),
+        patch(
+            "action_access_provisioner.access_provisioner_action.is_provisioning_failed",
+            return_value=False,
+        ),
         patch("action_access_provisioner.access_provisioner_action.get_connection"),
         patch.object(action, "_provision") as mock_provision,
     ):

@@ -194,6 +194,46 @@ def send_escalation_alert(
     _send(smtp_config, assignee_emails, subject, html, cc_addresses=escalation_recipients)
 
 
+def send_provisioning_failure_notification(
+    smtp_config: SmtpConfig,
+    request: AccessRequest,
+    error_message: str,
+) -> None:
+    """Notify the requestor (and approver via CC) that provisioning failed permanently."""
+    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    if not to:
+        logger.warning(
+            f"[Email] No requestor email for {request.urn} — skipping failure notification"
+        )
+        return
+
+    subject = "⚠️ DataHub access request could not be provisioned"
+    resource = request.resource or "—"
+    db = request.form_fields.snowflake_database or "—"
+    schema = request.form_fields.snowflake_schema or "(all schemas)"
+
+    html = f"""
+<html><body style="font-family: Arial, sans-serif; color: #333;">
+  <h2 style="color: #fd7e14;">Access Provisioning Failed</h2>
+  <p>Your access request in DataHub was approved, but automatic Snowflake provisioning failed
+  with a permanent error. A member of the data platform team has been notified.</p>
+  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+    <tr><td style="padding: 6px; font-weight: bold;">DataHub Resource</td><td style="padding: 6px;">{resource}</td></tr>
+    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Snowflake Database</td><td style="padding: 6px;">{db}</td></tr>
+    <tr><td style="padding: 6px; font-weight: bold;">Snowflake Schema</td><td style="padding: 6px;">{schema}</td></tr>
+    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Error</td>
+        <td style="padding: 6px; color: #dc3545;"><code>{error_message}</code></td></tr>
+    <tr><td style="padding: 6px; font-weight: bold;">Request URN</td>
+        <td style="padding: 6px; font-size: 12px; color: #888;">{request.urn}</td></tr>
+  </table>
+  <p style="margin-top: 16px;">Please contact your data platform team to resolve the issue
+  and manually grant access if required.</p>
+  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated notification from DataHub Access Provisioner.</p>
+</body></html>
+"""
+    _send(smtp_config, to, subject, html)
+
+
 def send_revocation_notification(
     smtp_config: SmtpConfig,
     grant: GrantRecord,

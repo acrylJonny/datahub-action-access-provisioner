@@ -11,7 +11,12 @@ from action_access_provisioner.config import (
     SnowflakeProvisioningConfig,
     StateConfig,
 )
-from action_access_provisioner.constants import DDL_GRANTS_TABLE, DDL_SLA_TABLE, SCHEMA_ALL
+from action_access_provisioner.constants import (
+    DDL_ERRORS_TABLE,
+    DDL_GRANTS_TABLE,
+    DDL_SLA_TABLE,
+    SCHEMA_ALL,
+)
 from action_access_provisioner.models import GrantRecord
 
 logger = logging.getLogger(__name__)
@@ -278,12 +283,14 @@ def _execute(
 
 
 def ensure_state_tables(conn, state: StateConfig) -> None:
-    """Create the grants and SLA-notification tracking tables if they don't already exist."""
+    """Create the grants, SLA-notification, and errors tracking tables if they don't already exist."""
     with _cursor(conn) as cur:
         cur.execute(DDL_GRANTS_TABLE.format(table=state.qualified_grants_table))
         cur.execute(DDL_SLA_TABLE.format(table=state.qualified_sla_table))
+        cur.execute(DDL_ERRORS_TABLE.format(table=state.qualified_errors_table))
     logger.info(
-        f"[State] State tables ready: {state.qualified_grants_table}, {state.qualified_sla_table}"
+        f"[State] State tables ready: {state.qualified_grants_table}, "
+        f"{state.qualified_sla_table}, {state.qualified_errors_table}"
     )
 
 
@@ -455,3 +462,59 @@ def record_sla_notification(
             sql, (action_request_urn, notification_type, action_request_urn, notification_type)
         )
     logger.debug(f"[State] Recorded SLA notification {notification_type} for {action_request_urn}")
+
+
+# ---------------------------------------------------------------------------
+# Permanent provisioning failure tracking
+# ---------------------------------------------------------------------------
+
+# Snowflake ProgrammingError errno values that indicate a permanent failure
+# (i.e. retrying will never succeed without a human fix):
+#   002003 — SQL compilation error: object does not exist (role, database, schema, …)
+#   002001 — Object does not exist (legacy code used in older Snowflake versions)
+_PERMANENT_SNOWFLAKE_ERRNOS = {2001, 2003}
+
+
+def is_permanent_snowflake_error(exc: Exception) -> bool:
+    """Return True if the exception is a Snowflake error that will never succeed on retry."""
+    try:
+        from snowflake.connector.errors import ProgrammingError
+
+        if isinstance(exc, ProgrammingError):
+            return exc.errno in _PERMANENT_SNOWFLAKE_ERRNOS
+    except ImportError:
+        pass
+    return False
+
+
+def is_provisioning_failed(conn, action_request_urn: str, state: StateConfig) -> bool:
+    """Return True if this request URN has a previously-recorded permanent failure."""
+    sql = f"SELECT COUNT(*) FROM {state.qualified_errors_table} WHERE ACTION_REQUEST_URN = %s"
+    with _cursor(conn) as cur:
+        cur.execute(sql, (action_request_urn,))
+        row = cur.fetchone()
+        return bool(row and row[0] > 0)
+
+
+def record_provisioning_error(
+    conn,
+    action_request_urn: str,
+    error_code: str | None,
+    error_message: str,
+    state: StateConfig,
+) -> None:
+    """Record a permanent provisioning failure so the request is not retried."""
+    sql = (
+        f"INSERT INTO {state.qualified_errors_table} "
+        f"(ACTION_REQUEST_URN, SNOWFLAKE_ERROR_CODE, ERROR_MESSAGE, FAILED_AT) "
+        f"SELECT %s, %s, %s, CURRENT_TIMESTAMP() "
+        f"WHERE NOT EXISTS ("
+        f"  SELECT 1 FROM {state.qualified_errors_table} "
+        f"  WHERE ACTION_REQUEST_URN = %s"
+        f")"
+    )
+    with _cursor(conn) as cur:
+        cur.execute(sql, (action_request_urn, error_code, error_message, action_request_urn))
+    logger.warning(
+        f"[State] Recorded permanent provisioning failure for {action_request_urn}: {error_message}"
+    )
