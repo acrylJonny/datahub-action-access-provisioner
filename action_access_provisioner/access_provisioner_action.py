@@ -276,6 +276,13 @@ class AccessProvisionerAction(Action):
             if is_permanent_snowflake_error(exc):
                 error_code = str(getattr(exc, "errno", "")) or None
                 error_msg = str(exc)
+                # Check before sending so the notification is only ever sent once,
+                # even if the errors-table write fails and the catchup guard misses.
+                already_notified = False
+                try:
+                    already_notified = is_provisioning_failed(conn, request.urn, self.config.state)
+                except Exception:
+                    pass
                 try:
                     record_provisioning_error(
                         conn, request.urn, error_code, error_msg, self.config.state
@@ -284,12 +291,14 @@ class AccessProvisionerAction(Action):
                     logger.error(
                         f"[Provision] Failed to record error state for {request.urn}: {rec_exc}"
                     )
-                try:
-                    send_provisioning_failure_notification(self.config.smtp, request, error_msg)
-                except Exception as mail_exc:
-                    logger.error(
-                        f"[Provision] Failed to send failure notification for {request.urn}: {mail_exc}"
-                    )
+                if not already_notified:
+                    try:
+                        send_provisioning_failure_notification(self.config.smtp, request, error_msg)
+                    except Exception as mail_exc:
+                        logger.error(
+                            f"[Provision] Failed to send failure notification "
+                            f"for {request.urn}: {mail_exc}"
+                        )
             return
 
         # Persist grant to Snowflake state table
