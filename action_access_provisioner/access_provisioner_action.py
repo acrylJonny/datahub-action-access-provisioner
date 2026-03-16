@@ -52,6 +52,7 @@ from action_access_provisioner.snowflake import (
     ensure_state_tables,
     get_connection,
     get_expired_grants,
+    get_user_default_role,
     is_already_provisioned,
     is_sla_notified,
     provision_access,
@@ -233,7 +234,8 @@ class AccessProvisionerAction(Action):
 
     def _provision(self, request: AccessRequest) -> None:
         ff = request.form_fields
-        role = ff.snowflake_role
+        conn = self._get_snowflake_connection()
+        role = self._resolve_snowflake_role(request, conn)
         database = ff.snowflake_database
 
         if not role or not database:
@@ -249,7 +251,6 @@ class AccessProvisionerAction(Action):
         )
 
         try:
-            conn = self._get_snowflake_connection()
             sql_statements = provision_access(
                 conn=conn,
                 role=role,
@@ -270,12 +271,14 @@ class AccessProvisionerAction(Action):
         if ff.access_duration_days:
             expires_at_ms = int(time.time() * 1000) + ff.access_duration_days * 86_400_000
 
+        requestor_email = ff.requestor_email or self._extract_requestor_email(request.requestor_urn)
+
         grant = GrantRecord(
             action_request_urn=request.urn,
             snowflake_role=role,
             snowflake_database=database,
             snowflake_schema=ff.snowflake_schema,
-            requestor_email=ff.requestor_email,
+            requestor_email=requestor_email,
             granted_at_ms=int(time.time() * 1000),
             expires_at_ms=expires_at_ms,
         )
@@ -344,6 +347,78 @@ class AccessProvisionerAction(Action):
             "field_requestor_email": self.config.field_requestor_email,
             "field_justification": self.config.field_justification,
         }
+
+    def _extract_snowflake_username(self, requestor_urn: str) -> str | None:
+        """Derive a Snowflake username from a DataHub corpuser URN.
+
+        Strips the ``urn:li:corpuser:`` prefix and then applies the configured
+        ``requestor_username_format``:
+          - ``'urn_id'`` (default): use the identity segment as-is
+            (e.g. ``john.doe@company.com``).
+          - ``'email_local_part'``: strip the ``@domain`` suffix
+            (e.g. ``john.doe``).
+        """
+        prefix = "urn:li:corpuser:"
+        if not requestor_urn.startswith(prefix):
+            logger.warning(f"[Provision] Unexpected requestor URN format: {requestor_urn!r}")
+            return None
+        urn_id = requestor_urn[len(prefix) :]
+        fmt = self.config.provisioning.requestor_username_format
+        if fmt == "email_local_part" and "@" in urn_id:
+            return urn_id.split("@")[0]
+        return urn_id
+
+    def _extract_requestor_email(self, requestor_urn: str | None) -> str | None:
+        """Best-effort email extraction from the requestor URN.
+
+        If the URN identity segment looks like an email address (contains ``@``),
+        return it directly. Otherwise return None.
+        """
+        if not requestor_urn:
+            return None
+        prefix = "urn:li:corpuser:"
+        if requestor_urn.startswith(prefix):
+            urn_id = requestor_urn[len(prefix) :]
+            if "@" in urn_id:
+                return urn_id
+        return None
+
+    def _resolve_snowflake_role(self, request: AccessRequest, conn: Any) -> str | None:
+        """Return the Snowflake role to grant access to.
+
+        Resolution order:
+        1. ``snowflake_role`` form field — explicit, takes priority.
+        2. Look up the requestor's Snowflake ``DEFAULT_ROLE`` via
+           ``DESCRIBE USER "<username>"``, deriving the username from the
+           requestor's DataHub URN using the configured
+           ``requestor_username_format``.
+        """
+        if request.form_fields.snowflake_role:
+            return request.form_fields.snowflake_role
+
+        if not request.requestor_urn:
+            logger.warning(
+                f"[Provision] No snowflake_role in form and no requestor_urn "
+                f"for {request.urn} — cannot resolve role"
+            )
+            return None
+
+        username = self._extract_snowflake_username(request.requestor_urn)
+        if not username:
+            return None
+
+        role = get_user_default_role(conn, username)
+        if role:
+            logger.info(
+                f"[Provision] Resolved Snowflake role '{role}' for user '{username}' "
+                f"via DESCRIBE USER (requestor_urn={request.requestor_urn})"
+            )
+        else:
+            logger.warning(
+                f"[Provision] Could not resolve DEFAULT_ROLE for Snowflake user "
+                f"'{username}' (requestor_urn={request.requestor_urn})"
+            )
+        return role
 
     def _get_snowflake_connection(self) -> Any:
         if self._snowflake_conn is None:

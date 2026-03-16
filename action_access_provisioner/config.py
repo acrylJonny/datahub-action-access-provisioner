@@ -167,6 +167,18 @@ class SnowflakeProvisioningConfig(BaseModel):
         default=False,
         description="Log GRANT/REVOKE statements but do not execute them — useful for testing",
     )
+    requestor_username_format: str = Field(
+        default="urn_id",
+        description=(
+            "How to derive a Snowflake username from the DataHub requestor URN when the "
+            "snowflake_role form field is absent. "
+            "'urn_id' (default): use the identity segment of the URN as-is "
+            "(e.g. 'john.doe@company.com' from 'urn:li:corpuser:john.doe@company.com'). "
+            "'email_local_part': strip the @domain suffix "
+            "(e.g. 'john.doe' from 'urn:li:corpuser:john.doe@company.com'). "
+            "The provisioner then calls DESCRIBE USER to find that user's DEFAULT_ROLE."
+        ),
+    )
 
 
 class AccessProvisionerConfig(BaseModel):

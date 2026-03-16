@@ -11,6 +11,7 @@ from action_access_provisioner.config import (
     SnowflakeProvisioningConfig,
     StateConfig,
 )
+from action_access_provisioner.constants import DDL_GRANTS_TABLE, DDL_SLA_TABLE, SCHEMA_ALL
 from action_access_provisioner.models import GrantRecord
 
 logger = logging.getLogger(__name__)
@@ -28,6 +29,28 @@ def _cursor(conn) -> Generator[Any, None, None]:
 def get_connection(connection_config: SnowflakeConnectionConfig):
     """Create and return a Snowflake connection from the provided config."""
     return connection_config.get_native_connection()
+
+
+def get_user_default_role(conn, username: str) -> str | None:
+    """Look up the DEFAULT_ROLE of a Snowflake user.
+
+    Executes ``DESCRIBE USER "<username>"`` and returns the value of the
+    DEFAULT_ROLE property. Returns None if the user does not exist, has no
+    default role set, or the caller lacks permission to describe the user.
+
+    Requires the provisioner role to have MANAGE GRANTS (or SECURITYADMIN+).
+    """
+    with _cursor(conn) as cur:
+        try:
+            cur.execute(f'DESCRIBE USER "{username}"')
+            for row in cur.fetchall():
+                # DESCRIBE USER returns rows of (property, value, default)
+                if row[0] == "DEFAULT_ROLE" and row[1]:
+                    role = str(row[1]).strip()
+                    return role if role else None
+        except Exception as exc:
+            logger.warning(f"[Snowflake] Could not describe user '{username}': {exc}")
+    return None
 
 
 def grant_role_to_role(
@@ -252,41 +275,13 @@ def _execute(
 # row, and the expiry monitor would fire on Request A's row after 30 days,
 # revoking access that should be valid for another 30 days.
 #
-# SNOWFLAKE_SCHEMA uses an empty string '' as a sentinel for "all schemas"
-# because Snowflake composite PKs do not allow NULL components.
-
-_SCHEMA_ALL = ""  # sentinel stored when no schema is specified
-
-
-_DDL_GRANTS_TABLE = """
-CREATE TABLE IF NOT EXISTS {table} (
-    SNOWFLAKE_ROLE              VARCHAR       NOT NULL,
-    SNOWFLAKE_DATABASE          VARCHAR       NOT NULL,
-    SNOWFLAKE_SCHEMA            VARCHAR       NOT NULL DEFAULT '',
-    LATEST_ACTION_REQUEST_URN   VARCHAR       NOT NULL,
-    REQUESTOR_EMAIL             VARCHAR,
-    GRANTED_AT                  TIMESTAMP_NTZ NOT NULL,
-    EXPIRES_AT                  TIMESTAMP_NTZ,
-    REVOKED_AT                  TIMESTAMP_NTZ,
-    PRIMARY KEY (SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA)
-)
-"""
-
-_DDL_SLA_TABLE = """
-CREATE TABLE IF NOT EXISTS {table} (
-    ACTION_REQUEST_URN    VARCHAR      NOT NULL,
-    NOTIFICATION_TYPE     VARCHAR      NOT NULL,
-    SENT_AT               TIMESTAMP_NTZ NOT NULL,
-    PRIMARY KEY (ACTION_REQUEST_URN, NOTIFICATION_TYPE)
-)
-"""
 
 
 def ensure_state_tables(conn, state: StateConfig) -> None:
     """Create the grants and SLA-notification tracking tables if they don't already exist."""
     with _cursor(conn) as cur:
-        cur.execute(_DDL_GRANTS_TABLE.format(table=state.qualified_grants_table))
-        cur.execute(_DDL_SLA_TABLE.format(table=state.qualified_sla_table))
+        cur.execute(DDL_GRANTS_TABLE.format(table=state.qualified_grants_table))
+        cur.execute(DDL_SLA_TABLE.format(table=state.qualified_sla_table))
     logger.info(
         f"[State] State tables ready: {state.qualified_grants_table}, {state.qualified_sla_table}"
     )
@@ -322,7 +317,7 @@ def record_grant(conn, grant: GrantRecord, state: StateConfig) -> None:
       - Re-request after revocation: same MERGE path — REVOKED_AT is cleared and
                         the new expiry timer starts.
     """
-    schema_key = grant.snowflake_schema or _SCHEMA_ALL
+    schema_key = grant.snowflake_schema or SCHEMA_ALL
     expires_str = (
         datetime.fromtimestamp(grant.expires_at_ms / 1000, tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S"
@@ -405,7 +400,7 @@ def get_expired_grants(conn, state: StateConfig) -> list[GrantRecord]:
                     snowflake_role=role,
                     snowflake_database=db,
                     # Convert sentinel back to None so REVOKE logic works correctly
-                    snowflake_schema=schema_key if schema_key != _SCHEMA_ALL else None,
+                    snowflake_schema=schema_key if schema_key != SCHEMA_ALL else None,
                     requestor_email=email,
                     granted_at_ms=int(granted_at.timestamp() * 1000),
                     expires_at_ms=int(expires_at.timestamp() * 1000) if expires_at else None,
@@ -416,7 +411,7 @@ def get_expired_grants(conn, state: StateConfig) -> list[GrantRecord]:
 
 def record_revocation(conn, grant: GrantRecord, state: StateConfig) -> None:
     """Mark the grant row as revoked, keyed on the natural access combo."""
-    schema_key = grant.snowflake_schema or _SCHEMA_ALL
+    schema_key = grant.snowflake_schema or SCHEMA_ALL
     sql = (
         f"UPDATE {state.qualified_grants_table} "
         f"SET REVOKED_AT = CURRENT_TIMESTAMP() "

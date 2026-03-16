@@ -8,6 +8,7 @@ from action_access_provisioner.config import SnowflakeProvisioningConfig
 from action_access_provisioner.models import GrantRecord
 from action_access_provisioner.snowflake import (
     _execute,
+    get_user_default_role,
     provision_access,
     revoke_access,
 )
@@ -107,3 +108,56 @@ def test_revoke_access_without_schema(mock_conn, dry_run_provisioning):
     )
     statements = revoke_access(mock_conn, grant, dry_run_provisioning)
     assert any("REVOKE USAGE ON DATABASE PROD" in s for s in statements)
+
+
+# ---------------------------------------------------------------------------
+# get_user_default_role
+# ---------------------------------------------------------------------------
+
+
+def _make_describe_conn(rows: list[tuple]) -> MagicMock:
+    """Build a mock connection whose cursor().fetchall() returns *rows*.
+
+    _cursor() in snowflake.py calls conn.cursor() directly (not as a context
+    manager), so we only need conn.cursor.return_value = cursor.
+    """
+    cursor = MagicMock()
+    cursor.fetchall.return_value = rows
+    conn = MagicMock()
+    conn.cursor.return_value = cursor
+    return conn
+
+
+def test_get_user_default_role_returns_role():
+    rows = [
+        ("NAME", "JOHN.DOE", "null"),
+        ("LOGIN_NAME", "JOHN.DOE@COMPANY.COM", "null"),
+        ("DEFAULT_ROLE", "ANALYST_ROLE", "null"),
+        ("DEFAULT_WAREHOUSE", "COMPUTE_WH", "null"),
+    ]
+    conn = _make_describe_conn(rows)
+    assert get_user_default_role(conn, "john.doe") == "ANALYST_ROLE"
+
+
+def test_get_user_default_role_missing_row_returns_none():
+    rows = [
+        ("NAME", "JOHN.DOE", "null"),
+        ("DEFAULT_WAREHOUSE", "COMPUTE_WH", "null"),
+    ]
+    conn = _make_describe_conn(rows)
+    assert get_user_default_role(conn, "john.doe") is None
+
+
+def test_get_user_default_role_empty_value_returns_none():
+    rows = [("DEFAULT_ROLE", "", "null")]
+    conn = _make_describe_conn(rows)
+    assert get_user_default_role(conn, "john.doe") is None
+
+
+def test_get_user_default_role_snowflake_error_returns_none():
+    cursor = MagicMock()
+    cursor.execute.side_effect = Exception("002003: user not found")
+    conn = MagicMock()
+    conn.cursor.return_value.__enter__ = lambda self: cursor
+    conn.cursor.return_value.__exit__ = MagicMock(return_value=False)
+    assert get_user_default_role(conn, "unknown_user") is None

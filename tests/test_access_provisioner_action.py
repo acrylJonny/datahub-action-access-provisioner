@@ -330,9 +330,16 @@ def test_provision_skips_when_missing_role(
     approved_request.form_fields.snowflake_role = None
     action = _create_action(base_config_dict, mock_pipeline_context)
 
-    with patch(
-        "action_access_provisioner.access_provisioner_action.provision_access"
-    ) as mock_provision:
+    with (
+        patch("action_access_provisioner.access_provisioner_action.get_connection"),
+        patch(
+            "action_access_provisioner.access_provisioner_action.get_user_default_role",
+            return_value=None,
+        ),
+        patch(
+            "action_access_provisioner.access_provisioner_action.provision_access"
+        ) as mock_provision,
+    ):
         action._provision(approved_request)
         mock_provision.assert_not_called()
 
@@ -431,6 +438,141 @@ def test_sla_escalation_sent_for_old_request(base_config_dict, mock_pipeline_con
         mock_escalate.assert_called_once()
         mock_warn.assert_not_called()
 
+    action.close()
+
+
+# ---------------------------------------------------------------------------
+# Role resolution helpers
+# ---------------------------------------------------------------------------
+
+
+def test_extract_snowflake_username_urn_id(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    assert (
+        action._extract_snowflake_username("urn:li:corpuser:john.doe@company.com")
+        == "john.doe@company.com"
+    )
+    action.close()
+
+
+def test_extract_snowflake_username_email_local_part(base_config_dict, mock_pipeline_context):
+    cfg = {
+        **base_config_dict,
+        "provisioning": {"dry_run": True, "requestor_username_format": "email_local_part"},
+    }
+    action = _create_action(cfg, mock_pipeline_context)
+    assert action._extract_snowflake_username("urn:li:corpuser:john.doe@company.com") == "john.doe"
+    action.close()
+
+
+def test_extract_snowflake_username_email_local_part_no_at(base_config_dict, mock_pipeline_context):
+    cfg = {
+        **base_config_dict,
+        "provisioning": {"dry_run": True, "requestor_username_format": "email_local_part"},
+    }
+    action = _create_action(cfg, mock_pipeline_context)
+    # No @ in urn_id — falls back to returning the urn_id as-is
+    assert action._extract_snowflake_username("urn:li:corpuser:johndoe") == "johndoe"
+    action.close()
+
+
+def test_extract_snowflake_username_unknown_urn_format(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    assert action._extract_snowflake_username("urn:li:dataset:something") is None
+    action.close()
+
+
+def test_extract_requestor_email_from_email_urn(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    assert (
+        action._extract_requestor_email("urn:li:corpuser:alice@example.com") == "alice@example.com"
+    )
+    action.close()
+
+
+def test_extract_requestor_email_non_email_urn(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    assert action._extract_requestor_email("urn:li:corpuser:alice") is None
+    action.close()
+
+
+def test_extract_requestor_email_none_urn(base_config_dict, mock_pipeline_context):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    assert action._extract_requestor_email(None) is None
+    action.close()
+
+
+def test_resolve_snowflake_role_uses_form_field(base_config_dict, mock_pipeline_context):
+    """When the form field is populated, it should be used directly without Snowflake lookup."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = AccessRequest(
+        urn="urn:li:actionRequest:001",
+        status="COMPLETED",
+        result="ACCEPTED",
+        note=None,
+        request_type="WORKFLOW_FORM_REQUEST",
+        resource=None,
+        requestor_urn="urn:li:corpuser:alice@example.com",
+        created_ms=0,
+        due_date_ms=None,
+        form_fields=FormFieldValues(snowflake_role="EXPLICIT_ROLE", snowflake_database="DB"),
+    )
+    mock_conn = MagicMock()
+    with patch(
+        "action_access_provisioner.access_provisioner_action.get_user_default_role"
+    ) as mock_lookup:
+        role = action._resolve_snowflake_role(request, mock_conn)
+    assert role == "EXPLICIT_ROLE"
+    mock_lookup.assert_not_called()
+    action.close()
+
+
+def test_resolve_snowflake_role_falls_back_to_snowflake_lookup(
+    base_config_dict, mock_pipeline_context
+):
+    """When snowflake_role is absent, the DEFAULT_ROLE is fetched from Snowflake."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = AccessRequest(
+        urn="urn:li:actionRequest:002",
+        status="COMPLETED",
+        result="ACCEPTED",
+        note=None,
+        request_type="WORKFLOW_FORM_REQUEST",
+        resource=None,
+        requestor_urn="urn:li:corpuser:bob@example.com",
+        created_ms=0,
+        due_date_ms=None,
+        form_fields=FormFieldValues(snowflake_database="DB"),  # no snowflake_role
+    )
+    mock_conn = MagicMock()
+    with patch(
+        "action_access_provisioner.access_provisioner_action.get_user_default_role",
+        return_value="BOB_DEFAULT_ROLE",
+    ) as mock_lookup:
+        role = action._resolve_snowflake_role(request, mock_conn)
+    assert role == "BOB_DEFAULT_ROLE"
+    mock_lookup.assert_called_once_with(mock_conn, "bob@example.com")
+    action.close()
+
+
+def test_resolve_snowflake_role_no_urn_and_no_form_field(base_config_dict, mock_pipeline_context):
+    """When neither form field nor requestor URN is available, returns None."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = AccessRequest(
+        urn="urn:li:actionRequest:003",
+        status="COMPLETED",
+        result="ACCEPTED",
+        note=None,
+        request_type="WORKFLOW_FORM_REQUEST",
+        resource=None,
+        requestor_urn=None,
+        created_ms=0,
+        due_date_ms=None,
+        form_fields=FormFieldValues(snowflake_database="DB"),
+    )
+    mock_conn = MagicMock()
+    role = action._resolve_snowflake_role(request, mock_conn)
+    assert role is None
     action.close()
 
 

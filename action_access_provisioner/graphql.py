@@ -6,6 +6,10 @@ from typing import Any
 
 from pydantic import ValidationError
 
+from action_access_provisioner.constants import (
+    FETCH_ACTION_REQUEST_QUERY,
+    LIST_ACTION_REQUESTS_QUERY,
+)
 from action_access_provisioner.gql_types import (
     GqlFetchActionRequestData,
     GqlListActionRequestsData,
@@ -39,74 +43,6 @@ def _execute_graphql(graph: object, query: str, variables: dict) -> Any:
     )
 
 
-# Note: ActionRequest does NOT implement Entity, so searchAcrossEntities cannot be used.
-# The listActionRequests query (ListActionRequestsInput) is the correct API.
-# All fields are top-level — there is no actionRequestInfo / actionRequestStatus wrapper.
-
-# Fetch a single ActionRequest by URN
-_FETCH_ACTION_REQUEST_QUERY = """
-query fetchActionRequest($urn: String!) {
-  actionRequest(urn: $urn) {
-    urn
-    type
-    status
-    result
-    resultNote
-    entity { urn }
-    assignedUsers
-    assignedGroups
-    created { time actor { urn } }
-    dueDate
-    params {
-      workflowFormRequest {
-        fields {
-          id
-          values {
-            ... on StringValue { stringValue }
-            ... on NumberValue { numberValue }
-          }
-        }
-        access { expiresAt }
-      }
-    }
-  }
-}
-"""
-
-# List ActionRequests with server-side type/status filtering
-_LIST_ACTION_REQUESTS_QUERY = """
-query listActionRequests($input: ListActionRequestsInput!) {
-  listActionRequests(input: $input) {
-    total
-    actionRequests {
-      urn
-      type
-      status
-      result
-      resultNote
-      entity { urn }
-      assignedUsers
-      assignedGroups
-      created { time actor { urn } }
-      dueDate
-      params {
-        workflowFormRequest {
-          fields {
-            id
-            values {
-              ... on StringValue { stringValue }
-              ... on NumberValue { numberValue }
-            }
-          }
-          access { expiresAt }
-        }
-      }
-    }
-  }
-}
-"""
-
-
 def fetch_action_request(
     graph: object,
     urn: str,
@@ -114,7 +50,7 @@ def fetch_action_request(
 ) -> AccessRequest | None:
     """Fetch and parse a single ActionRequest by URN."""
     try:
-        raw = _execute_graphql(graph, _FETCH_ACTION_REQUEST_QUERY, variables={"urn": urn})
+        raw = _execute_graphql(graph, FETCH_ACTION_REQUEST_QUERY, variables={"urn": urn})
     except Exception as exc:
         logger.error(f"GraphQL error fetching action request {urn}: {exc}")
         return None
@@ -149,7 +85,7 @@ def fetch_pending_action_requests(
     }
 
     try:
-        raw = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
+        raw = _execute_graphql(graph, LIST_ACTION_REQUESTS_QUERY, variables=variables)
     except Exception as exc:
         logger.error(f"GraphQL error fetching pending requests: {exc}")
         return []
@@ -193,7 +129,7 @@ def fetch_all_approved_requests(
         }
 
         try:
-            raw = _execute_graphql(graph, _LIST_ACTION_REQUESTS_QUERY, variables=variables)
+            raw = _execute_graphql(graph, LIST_ACTION_REQUESTS_QUERY, variables=variables)
         except Exception as exc:
             logger.error(f"GraphQL error fetching approved requests (start={start}): {exc}")
             break

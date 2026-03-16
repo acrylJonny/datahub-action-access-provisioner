@@ -7,9 +7,9 @@ from unittest.mock import MagicMock
 import pytest
 
 from action_access_provisioner.config import StateConfig
+from action_access_provisioner.constants import SCHEMA_ALL as _SCHEMA_ALL
 from action_access_provisioner.models import GrantRecord
 from action_access_provisioner.snowflake import (
-    _SCHEMA_ALL,
     ensure_state_tables,
     get_expired_grants,
     is_already_provisioned,
