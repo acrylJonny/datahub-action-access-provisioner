@@ -280,14 +280,20 @@ def ensure_state_tables(conn, state: DatabricksStateConfig) -> None:
 
 def is_already_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
     """Return True if this request URN's grant is still active (not revoked)."""
+    # ponytail: integer result columns are CAST to STRING throughout this module
+    # because databricks-sql-connector 2.9.x converts arrow results via
+    # pandas.to_numpy(na_value=None), which raises on *any* int column under
+    # numpy 2.x (it coerces None to the int dtype before applying the null mask).
+    # Casting to STRING yields an object column that survives the conversion.
+    # Upgrade path: connector >= 3.x reads native types and makes this unnecessary.
     sql = (
-        f"SELECT COUNT(*) FROM {state.qualified_grants_table} "
+        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_grants_table} "
         f"WHERE latest_action_request_urn = %(urn)s AND revoked_at_ms IS NULL"
     )
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
         row = cur.fetchone()
-        return bool(row and row[0] > 0)
+        return bool(row and int(row[0]) > 0)
 
 
 def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfig) -> None:
@@ -339,9 +345,10 @@ def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfi
 def get_expired_grants(conn, state: DatabricksStateConfig) -> list[DatabricksGrantRecord]:
     """Return all active grants whose expiry is in the past."""
     now_ms = int(time.time() * 1000)
+    # CAST the bigint timestamp columns to STRING — see is_already_provisioned().
     sql = (
         f"SELECT latest_action_request_urn, grantee, dbx_catalog, dbx_schema, dbx_table, "
-        f"requestor_email, granted_at_ms, expires_at_ms "
+        f"requestor_email, CAST(granted_at_ms AS STRING), CAST(expires_at_ms AS STRING) "
         f"FROM {state.qualified_grants_table} "
         f"WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= %(now)s AND revoked_at_ms IS NULL"
     )
@@ -394,14 +401,15 @@ def is_sla_notified(
     conn, action_request_urn: str, notification_type: str, state: DatabricksStateConfig
 ) -> bool:
     """Return True if this SLA notification has already been sent."""
+    # CAST COUNT to STRING — see is_already_provisioned().
     sql = (
-        f"SELECT COUNT(*) FROM {state.qualified_sla_table} "
+        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_sla_table} "
         f"WHERE action_request_urn = %(urn)s AND notification_type = %(ntype)s"
     )
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn, "ntype": notification_type})
         row = cur.fetchone()
-        return bool(row and row[0] > 0)
+        return bool(row and int(row[0]) > 0)
 
 
 def record_sla_notification(
@@ -461,11 +469,15 @@ def is_permanent_databricks_error(exc: Exception) -> bool:
 
 def is_provisioning_failed(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
     """Return True if this request URN has a recorded permanent failure."""
-    sql = f"SELECT COUNT(*) FROM {state.qualified_errors_table} WHERE action_request_urn = %(urn)s"
+    # CAST COUNT to STRING — see is_already_provisioned().
+    sql = (
+        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_errors_table} "
+        f"WHERE action_request_urn = %(urn)s"
+    )
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
         row = cur.fetchone()
-        return bool(row and row[0] > 0)
+        return bool(row and int(row[0]) > 0)
 
 
 def record_provisioning_error(

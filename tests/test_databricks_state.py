@@ -61,7 +61,8 @@ def test_ensure_state_tables_creates_three_tables(mock_conn, state_config):
 
 def test_is_already_provisioned_uses_urn_and_revoked_guard(mock_conn, state_config):
     conn, cursor = mock_conn
-    cursor.fetchone.return_value = (1,)
+    # The connector returns the CAST(COUNT(*) AS STRING) value as a string.
+    cursor.fetchone.return_value = ("1",)
     assert is_already_provisioned(conn, "urn:li:actionRequest:001", state_config) is True
     sql = cursor.execute.call_args[0][0]
     assert "latest_action_request_urn" in sql
@@ -108,14 +109,17 @@ def test_get_expired_grants_converts_sentinels_back_to_none(mock_conn, state_con
             SCHEMA_ALL,
             TABLE_ALL,
             "alice@example.com",
-            1000,
-            2000,
+            "1000",
+            "2000",
         )
     ]
     grants = get_expired_grants(conn, state_config)
     assert len(grants) == 1
     assert grants[0].schema is None
     assert grants[0].table is None
+    # Timestamps arrive as strings (CAST AS STRING) but are parsed back to int.
+    assert grants[0].granted_at_ms == 1000
+    assert grants[0].expires_at_ms == 2000
 
 
 def test_record_revocation_keys_on_natural_combo(mock_conn, state_config, grant_with_expiry):
@@ -137,8 +141,30 @@ def test_sla_notification_is_idempotent_merge(mock_conn, state_config):
 
 def test_is_sla_notified_false(mock_conn, state_config):
     conn, cursor = mock_conn
-    cursor.fetchone.return_value = (0,)
+    cursor.fetchone.return_value = ("0",)
     assert is_sla_notified(conn, "urn:li:actionRequest:008", "warning", state_config) is False
+
+
+def test_integer_result_columns_are_cast_to_string(mock_conn, state_config):
+    # databricks-sql-connector 2.9.x crashes converting *any* int result column
+    # under numpy 2.x (pandas.to_numpy(na_value=None)). Every SELECT that would
+    # otherwise return an int must CAST it to STRING; guard against regressions.
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("0",)
+    cursor.fetchall.return_value = []
+    int_returning_calls = [
+        lambda: is_already_provisioned(conn, "urn:li:actionRequest:001", state_config),
+        lambda: is_sla_notified(conn, "urn:li:actionRequest:008", "warning", state_config),
+        lambda: is_provisioning_failed(conn, "urn:li:actionRequest:011", state_config),
+        lambda: get_expired_grants(conn, state_config),
+    ]
+    for call in int_returning_calls:
+        cursor.reset_mock()
+        cursor.fetchone.return_value = ("0",)
+        cursor.fetchall.return_value = []
+        call()
+        sql = cursor.execute.call_args[0][0]
+        assert "CAST(" in sql and "AS STRING)" in sql, f"int column not cast in: {sql}"
 
 
 def test_record_provisioning_error_merge(mock_conn, state_config):
