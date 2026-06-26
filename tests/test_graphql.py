@@ -1,5 +1,3 @@
-"""Unit tests for DataHub GraphQL helpers and GQL Pydantic response models."""
-
 from unittest.mock import MagicMock
 
 import pytest

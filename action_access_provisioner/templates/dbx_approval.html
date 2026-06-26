@@ -1,0 +1,10 @@
+    <p>Your access request in DataHub has been <strong>approved</strong> and Databricks access has been provisioned.</p>
+    <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
+      <tr><td style="padding: 6px; font-weight: bold;">DataHub Resource</td><td style="padding: 6px;">{resource}</td></tr>
+      <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Unity Catalog Target</td><td style="padding: 6px;">{target}</td></tr>
+      <tr><td style="padding: 6px; font-weight: bold;">Granted To</td><td style="padding: 6px;">{granted_to}</td></tr>
+      <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Access Duration</td><td style="padding: 6px;">{duration}</td></tr>
+      {note_row}
+    </table>
+    <h3 style="margin-top: 24px;">Grants applied in Databricks</h3>
+    <pre style="background:#f4f4f4; padding: 12px; border-radius: 4px; font-size: 13px;">{sql_block}</pre>

@@ -1,15 +1,16 @@
-"""Gmail SMTP email notification helpers."""
-
 import logging
 import smtplib
 import ssl
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from importlib import resources
 
 from action_access_provisioner.config import SmtpConfig
-from action_access_provisioner.models import AccessRequest, GrantRecord
+from action_access_provisioner.models import AccessRequest, DatabricksGrantRecord, GrantRecord
 
 logger = logging.getLogger(__name__)
+
+_DEFAULT_FOOTER = "This is an automated notification from DataHub Access Provisioner."
 
 
 def _send(
@@ -56,9 +57,33 @@ def _send(
         raise
 
 
-# ---------------------------------------------------------------------------
-# Email templates
-# ---------------------------------------------------------------------------
+def _load_template(name: str) -> str:
+    return (
+        resources.files("action_access_provisioner")
+        .joinpath("templates")
+        .joinpath(name)
+        .read_text(encoding="utf-8")
+    )
+
+
+def _render(
+    body_template: str,
+    *,
+    heading_color: str,
+    heading: str,
+    footer: str = _DEFAULT_FOOTER,
+    **body_vars: str,
+) -> str:
+    """Render a body fragment into the shared base layout.
+
+    Substituted values are passed as ``str.format`` args, so braces inside the
+    values (e.g. an error message) are never re-interpreted — only the static
+    template literals are.
+    """
+    body = _load_template(body_template).format(**body_vars)
+    return _load_template("base.html").format(
+        heading_color=heading_color, heading=heading, body=body, footer=footer
+    )
 
 
 def send_approval_notification(
@@ -68,43 +93,30 @@ def send_approval_notification(
 ) -> None:
     """Notify the requestor that their access request has been approved and provisioned."""
     to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
-    subject = "✅ Your DataHub access request has been approved"
-
-    db = request.form_fields.snowflake_database or "—"
-    schema = request.form_fields.snowflake_schema or "(all schemas)"
-    role = request.form_fields.snowflake_role or "—"
-    duration = (
-        f"{request.form_fields.access_duration_days} days"
-        if request.form_fields.access_duration_days
-        else "Indefinite"
-    )
     note = request.note or ""
-    resource = request.resource or "—"
-
-    sql_block = (
-        "\n".join(f"  {s}" for s in sql_statements)
-        if sql_statements
-        else "  (no statements executed)"
+    note_row = (
+        "<tr style='background:#f9f9f9'><td style='padding:6px;font-weight:bold;'>Approver Note"
+        f"</td><td style='padding:6px;'>{note}</td></tr>"
+        if note
+        else ""
     )
-
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #28a745;">Access Request Approved</h2>
-  <p>Your access request in DataHub has been <strong>approved</strong> and Snowflake access has been provisioned.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-    <tr><td style="padding: 6px; font-weight: bold;">DataHub Resource</td><td style="padding: 6px;">{resource}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Snowflake Database</td><td style="padding: 6px;">{db}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Snowflake Schema</td><td style="padding: 6px;">{schema}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Role Granted</td><td style="padding: 6px;">{role}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Access Duration</td><td style="padding: 6px;">{duration}</td></tr>
-    {"<tr style='background:#f9f9f9'><td style='padding:6px;font-weight:bold;'>Approver Note</td><td style='padding:6px;'>" + note + "</td></tr>" if note else ""}
-  </table>
-  <h3 style="margin-top: 24px;">SQL executed in Snowflake</h3>
-  <pre style="background:#f4f4f4; padding: 12px; border-radius: 4px; font-size: 13px;">{sql_block}</pre>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated notification from DataHub Access Provisioner.</p>
-</body></html>
-"""
-    _send(smtp_config, to, subject, html)
+    html = _render(
+        "approval.html",
+        heading_color="#28a745",
+        heading="Access Request Approved",
+        resource=request.resource or "—",
+        database=request.form_fields.snowflake_database or "—",
+        schema=request.form_fields.snowflake_schema or "(all schemas)",
+        role=request.form_fields.snowflake_role or "—",
+        duration=(
+            f"{request.form_fields.access_duration_days} days"
+            if request.form_fields.access_duration_days
+            else "Indefinite"
+        ),
+        note_row=note_row,
+        sql_block=_sql_block(sql_statements),
+    )
+    _send(smtp_config, to, "✅ Your DataHub access request has been approved", html)
 
 
 def send_denial_notification(
@@ -113,21 +125,14 @@ def send_denial_notification(
 ) -> None:
     """Notify the requestor that their access request has been denied."""
     to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
-    subject = "❌ Your DataHub access request has been denied"
-
-    resource = request.resource or "—"
-    note = request.note or "No reason provided."
-
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #dc3545;">Access Request Denied</h2>
-  <p>Your access request in DataHub for <strong>{resource}</strong> has been <strong>denied</strong>.</p>
-  <p><strong>Reason:</strong> {note}</p>
-  <p>If you believe this decision is incorrect, please contact your data governance team.</p>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated notification from DataHub Access Provisioner.</p>
-</body></html>
-"""
-    _send(smtp_config, to, subject, html)
+    html = _render(
+        "denial.html",
+        heading_color="#dc3545",
+        heading="Access Request Denied",
+        resource=request.resource or "—",
+        note=request.note or "No reason provided.",
+    )
+    _send(smtp_config, to, "❌ Your DataHub access request has been denied", html)
 
 
 def send_sla_warning(
@@ -139,23 +144,17 @@ def send_sla_warning(
     datahub_url: str | None = None,
 ) -> None:
     """Remind approvers that a request has been pending longer than the SLA threshold."""
+    html = _render(
+        "sla_warning.html",
+        heading_color="#fd7e14",
+        heading="SLA Warning — Pending Access Request",
+        footer="This is an automated SLA reminder from DataHub Access Provisioner.",
+        pending_hours=f"{pending_hours:.0f}",
+        resource=resource or action_request_urn,
+        urn=action_request_urn,
+        link=_request_link(action_request_urn, datahub_url),
+    )
     subject = f"⚠️ Action required: access request pending for {pending_hours:.0f}h"
-    resource_str = resource or action_request_urn
-    link = f'<a href="{datahub_url}">{datahub_url}</a>' if datahub_url else action_request_urn
-
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #fd7e14;">SLA Warning — Pending Access Request</h2>
-  <p>The following access request has been pending for <strong>{pending_hours:.0f} hours</strong> without a decision.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-    <tr><td style="padding: 6px; font-weight: bold;">Resource</td><td style="padding: 6px;">{resource_str}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Request URN</td><td style="padding: 6px;">{action_request_urn}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Pending for</td><td style="padding: 6px;">{pending_hours:.0f} hours</td></tr>
-  </table>
-  <p style="margin-top: 16px;">Please review and action this request: {link}</p>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated SLA reminder from DataHub Access Provisioner.</p>
-</body></html>
-"""
     _send(smtp_config, assignee_emails, subject, html)
 
 
@@ -169,28 +168,20 @@ def send_escalation_alert(
     datahub_url: str | None = None,
 ) -> None:
     """Send escalation email when SLA has been significantly breached."""
+    html = _render(
+        "escalation.html",
+        heading_color="#dc3545",
+        heading="SLA Escalation — Overdue Access Request",
+        footer="This is an automated escalation from DataHub Access Provisioner.",
+        pending_hours=f"{pending_hours:.0f}",
+        resource=resource or action_request_urn,
+        urn=action_request_urn,
+        assignees=", ".join(assignee_emails) if assignee_emails else "—",
+        link=_request_link(action_request_urn, datahub_url),
+    )
     subject = (
         f"🚨 Escalation: access request pending {pending_hours:.0f}h — immediate action required"
     )
-    resource_str = resource or action_request_urn
-    link = f'<a href="{datahub_url}">{datahub_url}</a>' if datahub_url else action_request_urn
-
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #dc3545;">SLA Escalation — Overdue Access Request</h2>
-  <p>This is an escalation notice. The following access request has been pending for
-  <strong>{pending_hours:.0f} hours</strong> and has exceeded the escalation threshold.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-    <tr><td style="padding: 6px; font-weight: bold;">Resource</td><td style="padding: 6px;">{resource_str}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Request URN</td><td style="padding: 6px;">{action_request_urn}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Pending for</td><td style="padding: 6px;">{pending_hours:.0f} hours</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Assigned approvers</td>
-        <td style="padding: 6px;">{", ".join(assignee_emails) if assignee_emails else "—"}</td></tr>
-  </table>
-  <p style="margin-top: 16px;">Review the request immediately: {link}</p>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated escalation from DataHub Access Provisioner.</p>
-</body></html>
-"""
     _send(smtp_config, assignee_emails, subject, html, cc_addresses=escalation_recipients)
 
 
@@ -207,31 +198,17 @@ def send_provisioning_failure_notification(
         )
         return
 
-    subject = "⚠️ DataHub access request could not be provisioned"
-    resource = request.resource or "—"
-    db = request.form_fields.snowflake_database or "—"
-    schema = request.form_fields.snowflake_schema or "(all schemas)"
-
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #fd7e14;">Access Provisioning Failed</h2>
-  <p>Your access request in DataHub was approved, but automatic Snowflake provisioning failed
-  with a permanent error. A member of the data platform team has been notified.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-    <tr><td style="padding: 6px; font-weight: bold;">DataHub Resource</td><td style="padding: 6px;">{resource}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Snowflake Database</td><td style="padding: 6px;">{db}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Snowflake Schema</td><td style="padding: 6px;">{schema}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Error</td>
-        <td style="padding: 6px; color: #dc3545;"><code>{error_message}</code></td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Request URN</td>
-        <td style="padding: 6px; font-size: 12px; color: #888;">{request.urn}</td></tr>
-  </table>
-  <p style="margin-top: 16px;">Please contact your data platform team to resolve the issue
-  and manually grant access if required.</p>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated notification from DataHub Access Provisioner.</p>
-</body></html>
-"""
-    _send(smtp_config, to, subject, html)
+    html = _render(
+        "provisioning_failure.html",
+        heading_color="#fd7e14",
+        heading="Access Provisioning Failed",
+        resource=request.resource or "—",
+        database=request.form_fields.snowflake_database or "—",
+        schema=request.form_fields.snowflake_schema or "(all schemas)",
+        error_message=error_message,
+        urn=request.urn,
+    )
+    _send(smtp_config, to, "⚠️ DataHub access request could not be provisioned", html)
 
 
 def send_revocation_notification(
@@ -240,25 +217,105 @@ def send_revocation_notification(
 ) -> None:
     """Notify the original requestor that their access has been auto-revoked on expiry."""
     to = [grant.requestor_email] if grant.requestor_email else []
-    subject = "🔒 Your Snowflake access has expired and been revoked"
+    html = _render(
+        "revocation.html",
+        heading_color="#6c757d",
+        heading="Access Revoked — Expiry Reached",
+        database=grant.snowflake_database,
+        schema=grant.snowflake_schema or "(all schemas)",
+        role=grant.snowflake_role,
+        urn=grant.action_request_urn,
+    )
+    _send(smtp_config, to, "🔒 Your Snowflake access has expired and been revoked", html)
 
-    db = grant.snowflake_database
-    schema = grant.snowflake_schema or "(all schemas)"
-    role = grant.snowflake_role
 
-    html = f"""
-<html><body style="font-family: Arial, sans-serif; color: #333;">
-  <h2 style="color: #6c757d;">Access Revoked — Expiry Reached</h2>
-  <p>Your temporary Snowflake access has reached its expiry date and has been automatically revoked.</p>
-  <table style="border-collapse: collapse; width: 100%; max-width: 600px;">
-    <tr><td style="padding: 6px; font-weight: bold;">Snowflake Database</td><td style="padding: 6px;">{db}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Schema</td><td style="padding: 6px;">{schema}</td></tr>
-    <tr><td style="padding: 6px; font-weight: bold;">Role Revoked</td><td style="padding: 6px;">{role}</td></tr>
-    <tr style="background:#f9f9f9"><td style="padding: 6px; font-weight: bold;">Original Request</td>
-        <td style="padding: 6px;">{grant.action_request_urn}</td></tr>
-  </table>
-  <p>If you need continued access, please submit a new request via DataHub.</p>
-  <p style="color:#888; font-size: 12px; margin-top: 24px;">This is an automated notification from DataHub Access Provisioner.</p>
-</body></html>
-"""
-    _send(smtp_config, to, subject, html)
+def _dbx_target_label(catalog: str | None, schema: str | None, table: str | None) -> str:
+    """Render a Unity Catalog target as 'catalog.schema.table' with sensible fallbacks."""
+    cat = catalog or "—"
+    if table:
+        return f"{cat}.{schema}.{table}"
+    return f"{cat}.{schema or '(all schemas)'}"
+
+
+def send_dbx_approval_notification(
+    smtp_config: SmtpConfig,
+    request: AccessRequest,
+    sql_statements: list[str],
+) -> None:
+    """Notify the requestor that their Databricks access has been provisioned."""
+    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    ff = request.form_fields
+    note = request.note or ""
+    note_row = (
+        "<tr><td style='padding:6px;font-weight:bold;'>Approver Note"
+        f"</td><td style='padding:6px;'>{note}</td></tr>"
+        if note
+        else ""
+    )
+    html = _render(
+        "dbx_approval.html",
+        heading_color="#28a745",
+        heading="Access Request Approved",
+        resource=request.resource or "—",
+        target=_dbx_target_label(ff.databricks_catalog, ff.databricks_schema, ff.databricks_table),
+        granted_to=ff.requestor_email or "—",
+        duration=f"{ff.access_duration_days} days" if ff.access_duration_days else "Indefinite",
+        note_row=note_row,
+        sql_block=_sql_block(sql_statements),
+    )
+    _send(smtp_config, to, "✅ Your DataHub access request has been approved", html)
+
+
+def send_dbx_provisioning_failure_notification(
+    smtp_config: SmtpConfig,
+    request: AccessRequest,
+    error_message: str,
+) -> None:
+    """Notify the requestor that Databricks provisioning failed permanently."""
+    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    if not to:
+        logger.warning(
+            f"[Email] No requestor email for {request.urn} — skipping failure notification"
+        )
+        return
+
+    ff = request.form_fields
+    html = _render(
+        "dbx_provisioning_failure.html",
+        heading_color="#fd7e14",
+        heading="Access Provisioning Failed",
+        resource=request.resource or "—",
+        target=_dbx_target_label(ff.databricks_catalog, ff.databricks_schema, ff.databricks_table),
+        error_message=error_message,
+        urn=request.urn,
+    )
+    _send(smtp_config, to, "⚠️ DataHub access request could not be provisioned", html)
+
+
+def send_dbx_revocation_notification(
+    smtp_config: SmtpConfig,
+    grant: DatabricksGrantRecord,
+) -> None:
+    """Notify the original requestor that their Databricks access was auto-revoked."""
+    to = [grant.requestor_email] if grant.requestor_email else []
+    html = _render(
+        "dbx_revocation.html",
+        heading_color="#6c757d",
+        heading="Access Revoked — Expiry Reached",
+        target=_dbx_target_label(grant.catalog, grant.schema, grant.table),
+        principal=grant.principal,
+        urn=grant.action_request_urn,
+    )
+    _send(smtp_config, to, "🔒 Your Databricks access has expired and been revoked", html)
+
+
+def _sql_block(statements: list[str]) -> str:
+    if not statements:
+        return "  (no statements executed)"
+    return "\n".join(f"  {s}" for s in statements)
+
+
+def _request_link(action_request_urn: str, datahub_url: str | None) -> str:
+    if datahub_url:
+        return f'<a href="{datahub_url}">{datahub_url}</a>'
+    return action_request_urn

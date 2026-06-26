@@ -1,5 +1,3 @@
-"""DataHub GraphQL helpers for querying access requests."""
-
 import logging
 import time
 from typing import Any

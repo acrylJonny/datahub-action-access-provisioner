@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "datahub-action-access-provisioner"
 version = "0.1.14"
-description = "DataHub Action to provision Snowflake access and send email notifications on workflow approval"
+description = "DataHub Action to provision Snowflake or Databricks access and send email notifications on workflow approval"
 readme = "README.md"
 requires-python = ">=3.10"
 license = "Apache-2.0"
@@ -22,10 +22,19 @@ where = ["."]
 include = ["action_access_provisioner*"]
 exclude = ["tests*"]
 
+[tool.setuptools.package-data]
+action_access_provisioner = ["templates/*.html"]
+
 [project.optional-dependencies]
+databricks = [
+    "databricks-sql-connector>=3.0.0",
+    "databricks-sdk>=0.20.0",
+]
 dev = [
     "acryl-datahub-actions>=1.0.0",
     "acryl-datahub>=1.0.0",
+    "databricks-sql-connector>=3.0.0",
+    "databricks-sdk>=0.20.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "pytest>=7.0.0",
@@ -38,6 +47,7 @@ dev = [
 
 [project.entry-points."datahub_actions.action.plugins"]
 action-access-provisioner = "action_access_provisioner.access_provisioner_action:AccessProvisionerAction"
+action-access-provisioner-databricks = "action_access_provisioner.databricks_access_provisioner_action:DatabricksAccessProvisionerAction"
 
 [tool.ruff]
 line-length = 100
@@ -81,6 +91,24 @@ module = [
     "pytest.*",
     "freezegun.*",
 ]
+ignore_missing_imports = true
+
+# Don't follow into the Databricks SDK/connector or their heavy transitive deps
+# (pyarrow/numpy). Their bundled type stubs use PEP 695 syntax that mypy rejects
+# under python_version 3.10, and we only use them via lazy runtime imports.
+[[tool.mypy.overrides]]
+module = [
+    "databricks",
+    "databricks.*",
+    "numpy",
+    "numpy.*",
+    "pyarrow",
+    "pyarrow.*",
+    "pandas",
+    "pandas.*",
+]
+follow_imports = "skip"
+follow_imports_for_stubs = true
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]

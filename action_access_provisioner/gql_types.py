@@ -1,12 +1,3 @@
-"""Pydantic models representing DataHub GraphQL response shapes.
-
-These models mirror the exact JSON structure returned by the GraphQL API so that
-callers work with typed attribute access rather than raw dict.get() chains.
-
-Conversion methods (to_access_request, to_pending_summary) translate the API
-response into the domain models defined in models.py.
-"""
-
 import logging
 
 from pydantic import BaseModel, Field
@@ -126,6 +117,9 @@ class GqlWorkflowFormRequest(BaseModel):
             snowflake_database=_get("field_snowflake_database"),
             snowflake_schema=_get("field_snowflake_schema"),
             snowflake_role=_get("field_snowflake_role"),
+            databricks_catalog=_get("field_databricks_catalog"),
+            databricks_schema=_get("field_databricks_schema"),
+            databricks_table=_get("field_databricks_table"),
             access_duration_days=duration_int,
             requestor_email=_get("field_requestor_email"),
             justification=_get("field_justification"),

@@ -1,0 +1,160 @@
+from unittest.mock import MagicMock
+
+import pytest
+
+from action_access_provisioner.config import DatabricksProvisioningConfig
+from action_access_provisioner.databricks import (
+    build_grant_statements,
+    build_revoke_statements,
+    is_permanent_databricks_error,
+    provision_access,
+    revoke_access,
+)
+from action_access_provisioner.models import DatabricksGrantRecord
+
+
+@pytest.fixture
+def sql_conn():
+    conn = MagicMock()
+    cursor = MagicMock()
+    cursor.close = MagicMock()
+    conn.cursor.return_value = cursor
+    return conn, cursor
+
+
+# ---------------------------------------------------------------------------
+# Statement builders — privilege granularity
+# ---------------------------------------------------------------------------
+
+
+def test_grant_statements_catalog_only():
+    stmts = build_grant_statements("alice@example.com", "prod", None, None)
+    assert "GRANT USE CATALOG ON CATALOG `prod` TO `alice@example.com`" in stmts
+    assert any("GRANT SELECT ON CATALOG `prod`" in s for s in stmts)
+
+
+def test_grant_statements_schema_level():
+    stmts = build_grant_statements("alice@example.com", "prod", "sales", None)
+    assert any("USE SCHEMA ON SCHEMA `prod`.`sales`" in s for s in stmts)
+    assert any("SELECT ON SCHEMA `prod`.`sales`" in s for s in stmts)
+
+
+def test_grant_statements_table_level():
+    stmts = build_grant_statements("alice@example.com", "prod", "sales", "orders")
+    assert any("SELECT ON TABLE `prod`.`sales`.`orders`" in s for s in stmts)
+    # A specific table grant should not also blanket-grant SELECT on the schema.
+    assert not any("SELECT ON SCHEMA" in s for s in stmts)
+
+
+def test_grant_statements_reject_injection():
+    """Identifiers from form fields must be validated, not blindly quoted."""
+    with pytest.raises(ValueError):
+        build_grant_statements("alice@example.com", "prod`; DROP TABLE x; --", None, None)
+
+
+def test_revoke_statements_only_select_at_granted_level():
+    grant = DatabricksGrantRecord(
+        action_request_urn="urn:li:actionRequest:001",
+        principal="alice@example.com",
+        catalog="prod",
+        schema="sales",
+        table=None,
+        requestor_email="alice@example.com",
+        granted_at_ms=0,
+        expires_at_ms=None,
+    )
+    stmts = build_revoke_statements(grant)
+    assert stmts == ["REVOKE SELECT ON SCHEMA `prod`.`sales` FROM `alice@example.com`"]
+
+
+# ---------------------------------------------------------------------------
+# Execution paths
+# ---------------------------------------------------------------------------
+
+
+def test_provision_dry_run_does_not_execute(sql_conn):
+    conn, cursor = sql_conn
+    provisioning = DatabricksProvisioningConfig(dry_run=True, grant_method="sql")
+    stmts = provision_access(
+        sql_conn=conn,
+        workspace_client=None,
+        principal="alice@example.com",
+        catalog="prod",
+        schema="sales",
+        table=None,
+        provisioning=provisioning,
+    )
+    assert stmts
+    cursor.execute.assert_not_called()
+
+
+def test_provision_sql_executes_each_statement(sql_conn):
+    conn, cursor = sql_conn
+    provisioning = DatabricksProvisioningConfig(dry_run=False, grant_method="sql")
+    stmts = provision_access(
+        sql_conn=conn,
+        workspace_client=None,
+        principal="alice@example.com",
+        catalog="prod",
+        schema="sales",
+        table=None,
+        provisioning=provisioning,
+    )
+    assert cursor.execute.call_count == len(stmts)
+
+
+def test_provision_sdk_calls_grants_api():
+    provisioning = DatabricksProvisioningConfig(dry_run=False, grant_method="sdk")
+    workspace_client = MagicMock()
+    pytest.importorskip("databricks.sdk.service.catalog")
+    provision_access(
+        sql_conn=None,
+        workspace_client=workspace_client,
+        principal="alice@example.com",
+        catalog="prod",
+        schema="sales",
+        table="orders",
+        provisioning=provisioning,
+    )
+    # catalog USE_CATALOG + schema USE_SCHEMA + table SELECT = 3 updates
+    assert workspace_client.grants.update.call_count == 3
+
+
+def test_revoke_sql_executes(sql_conn):
+    conn, cursor = sql_conn
+    provisioning = DatabricksProvisioningConfig(dry_run=False, grant_method="sql")
+    grant = DatabricksGrantRecord(
+        action_request_urn="urn:li:actionRequest:002",
+        principal="bob@example.com",
+        catalog="prod",
+        schema=None,
+        table=None,
+        requestor_email="bob@example.com",
+        granted_at_ms=0,
+        expires_at_ms=None,
+    )
+    revoke_access(
+        sql_conn=conn,
+        workspace_client=None,
+        grant=grant,
+        provisioning=provisioning,
+    )
+    cursor.execute.assert_called_once()
+    assert "REVOKE SELECT ON CATALOG `prod`" in cursor.execute.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Permanent error detection
+# ---------------------------------------------------------------------------
+
+
+def test_permanent_error_for_missing_object():
+    assert is_permanent_databricks_error(Exception("Catalog 'prod' does not exist")) is True
+
+
+def test_permanent_error_for_invalid_identifier():
+    assert is_permanent_databricks_error(ValueError("Invalid Databricks identifier")) is True
+
+
+def test_transient_error_is_not_permanent():
+    assert is_permanent_databricks_error(Exception("connection reset by peer")) is False

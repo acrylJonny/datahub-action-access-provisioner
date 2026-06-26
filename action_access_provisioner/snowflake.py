@@ -1,5 +1,3 @@
-"""Snowflake GRANT, REVOKE, and persistent state table logic."""
-
 import logging
 from collections.abc import Generator
 from contextlib import contextmanager

@@ -1,5 +1,3 @@
-"""Unit tests for the AccessProvisionerAction."""
-
 import time
 from unittest.mock import MagicMock, Mock, patch
 

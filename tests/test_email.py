@@ -1,5 +1,3 @@
-"""Unit tests for email notification helpers."""
-
 import time
 from unittest.mock import MagicMock, patch
 

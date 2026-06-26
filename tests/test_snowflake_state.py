@@ -1,5 +1,3 @@
-"""Unit tests for Snowflake persistent state table helpers."""
-
 import time
 from datetime import datetime, timezone
 from unittest.mock import MagicMock

@@ -2,12 +2,23 @@
 
 A [DataHub Actions](https://datahubproject.io/docs/actions/) handler that automates:
 
-1. **Access provisioning** — executes Snowflake GRANT statements when a DataHub
-   access-request workflow is approved, then emails the requestor.
+1. **Access provisioning** — executes GRANT statements in **Snowflake** or
+   **Databricks (Unity Catalog)** when a DataHub access-request workflow is
+   approved, then emails the requestor.
 2. **SLA tracking** — sends reminder and escalation emails to approvers when
    requests sit pending beyond configurable thresholds.
-3. **Access expiry / auto-revocation** — automatically revokes Snowflake privileges
+3. **Access expiry / auto-revocation** — automatically revokes privileges
    when the declared access duration expires and notifies the original requestor.
+
+Two backends ship in this package, registered as separate action types:
+
+| Action type | Backend | Grantee | State/log tables |
+| ----------- | ------- | ------- | ---------------- |
+| `action-access-provisioner` | Snowflake | role | Snowflake tables |
+| `action-access-provisioner-databricks` | Databricks Unity Catalog | requestor's email (principal) | Delta tables |
+
+The Databricks backend is documented in [its own section](#databricks-backend); the
+rest of this README covers the Snowflake backend unless stated otherwise.
 
 ## How It Works
 
@@ -270,6 +281,85 @@ GRANT MANAGE GRANTS ON ACCOUNT TO ROLE <your_role>;
 -- or more specifically:
 GRANT GRANT OPTION FOR USAGE ON DATABASE <db> TO ROLE <your_role>;
 ```
+
+## Databricks backend
+
+The `action-access-provisioner-databricks` action provisions **Unity Catalog**
+read access instead of Snowflake roles. It shares the same scheduling model, SLA
+tracking, expiry/auto-revocation, and email plumbing — only the grant target and
+the state store differ.
+
+See [`examples/example_action_databricks.yaml`](examples/example_action_databricks.yaml)
+for a fully-annotated config.
+
+### Install
+
+```bash
+pip install -e ".[databricks]"   # databricks-sql-connector + databricks-sdk
+```
+
+### How grants work
+
+The grantee is the **requestor's email** (a Databricks principal — user, group,
+or service principal), resolved from the `requestor_email` form field (falling
+back to the requestor's corpuser identity). Targets come straight from the form
+fields, so the statements applied for a `catalog` / `catalog.schema` /
+`catalog.schema.table` request are:
+
+```sql
+GRANT USE CATALOG ON CATALOG `catalog` TO `user@example.com`;
+GRANT USE SCHEMA  ON SCHEMA  `catalog`.`schema` TO `user@example.com`;
+GRANT SELECT      ON {CATALOG|SCHEMA|TABLE} ... TO `user@example.com`;
+```
+
+Revocation only removes `SELECT` at the granted level — the navigation-only
+`USE CATALOG` / `USE SCHEMA` privileges are left in place so revoking one grant
+never breaks the principal's unrelated access elsewhere in the catalog.
+
+### platform_instance is never consulted
+
+Targets are read **only** from the workflow form fields, not parsed from the
+approved dataset's URN. A Databricks dataset ingested with a `platform_instance`
+has a URN like
+`urn:li:dataset:(urn:li:dataPlatform:databricks,<instance>.catalog.schema.table,PROD)`,
+but the provisioner ignores that entirely — so a `platform_instance` prefix can
+never change which Unity Catalog object gets granted.
+
+### Connection & auth
+
+A SQL warehouse (`http_path`) is always required: the Delta state/log tables live
+there, and (with `grant_method: sql`) GRANT/REVOKE statements run through it too.
+Two auth methods are supported:
+
+- **PAT** — set `token`.
+- **OAuth service principal** — set `client_id` + `client_secret`.
+
+`grant_method` selects how grants are applied:
+
+- `sql` (default) — runs GRANT/REVOKE through the SQL warehouse.
+- `sdk` — uses the Unity Catalog grants API (`databricks-sdk`), no SQL needed
+  for the grant itself (the warehouse is still used for the Delta state tables).
+
+### Delta state/log tables
+
+All state lives in Unity Catalog Delta tables (default `datahub.access_provisioner`):
+
+- `access_provisioner_grants` — every active grant, keyed on the natural combo
+  `(grantee, catalog, schema, table)` and reconciled with `MERGE`, exactly like
+  the Snowflake design (one active row per access combo; extensions update the
+  expiry in place). Empty-string sentinels stand in for "all schemas" / "all
+  tables" so the key never contains NULLs. Timestamps are stored as epoch-millis
+  `BIGINT` to keep expiry a plain integer compare.
+- `access_provisioner_sla_notifications` — dedups SLA emails across runs.
+- `access_provisioner_errors` — records permanent provisioning failures (e.g. a
+  missing catalog/principal) so they are not retried on every catchup pass.
+
+### Databricks principal requirements
+
+The configured user/service principal must be able to grant Unity Catalog
+privileges on the target securables and create tables in the state schema, e.g.
+ownership of (or `MANAGE` on) the relevant catalog/schema, plus `USE CATALOG` /
+`USE SCHEMA` / `CREATE TABLE` on the state schema.
 
 ## License
 

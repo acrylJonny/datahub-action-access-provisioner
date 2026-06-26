@@ -1,0 +1,137 @@
+# Example configuration for the Databricks Access Provisioner action
+#
+# Author: Jonny Dixon
+#
+# This is the Databricks counterpart of example_action.yaml. It provisions
+# Unity Catalog grants (instead of Snowflake roles) and stores all state in
+# Delta tables. The scheduling model is identical: the DataHub Cloud executor
+# kills actions after ~5 minutes of idle time, so run this on a schedule
+# (e.g. every 30 minutes). Each run does a startup catchup pass (provision new
+# approvals, revoke expired grants, send SLA reminders) and then listens for
+# live events for the remaining window.
+#
+# KEY DIFFERENCES FROM SNOWFLAKE
+# ------------------------------
+#   * The grantee is the requestor's email (a Databricks principal), not a role.
+#   * Targets are catalog.schema.table, read straight from the workflow form
+#     fields — the dataset's platform_instance is NEVER consulted, so a
+#     platform_instance prefix can't change what gets granted.
+#   * Grants are applied via the SQL warehouse (grant_method: sql) or the Unity
+#     Catalog grants API (grant_method: sdk).
+
+# =============================================================================
+# DATAHUB CLOUD DEPLOYMENT (recommended)
+# =============================================================================
+name: access-provisioner-databricks
+
+source:
+  type: datahub_integrations.sources.remote_actions.remote_action_source.RemoteActionSource
+  config:
+    action_urn: "urn:li:dataHubAction:access-provisioner-databricks"
+    stage: live
+    action_spec:
+      type: "action-access-provisioner-databricks"
+      config:
+        # ----------------------------------------------------------------
+        # Databricks connection (executes grants + holds Delta state tables)
+        # A SQL warehouse (http_path) is always required.
+        # Auth: PAT (token) OR OAuth service principal (client_id/secret).
+        # ----------------------------------------------------------------
+        databricks_connection:
+          host: "https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
+          http_path: "/sql/1.0/warehouses/abc123def456"
+          token: "${DATABRICKS_TOKEN}"            # PAT auth
+          # --- OR OAuth machine-to-machine (service principal) ---
+          # client_id: "${DATABRICKS_CLIENT_ID}"
+          # client_secret: "${DATABRICKS_CLIENT_SECRET}"
+
+        # ----------------------------------------------------------------
+        # State / log tables (Delta, in Unity Catalog).
+        # The catalog + schema must already exist; the provisioner role needs
+        # CREATE TABLE on the schema. Tables are created on first run.
+        # ----------------------------------------------------------------
+        state:
+          catalog: "datahub"
+          schema: "access_provisioner"
+          grants_table: "access_provisioner_grants"                 # default
+          sla_table: "access_provisioner_sla_notifications"         # default
+          errors_table: "access_provisioner_errors"                 # default
+
+        # ----------------------------------------------------------------
+        # Gmail SMTP (outbound email notifications)
+        # ----------------------------------------------------------------
+        smtp:
+          host: "smtp.gmail.com"
+          port: 587
+          username: "datahub-noreply@yourdomain.com"
+          password: "${GMAIL_APP_PASSWORD}"
+          from_address: "DataHub Access Bot <datahub-noreply@yourdomain.com>"
+          use_tls: true
+
+        # ----------------------------------------------------------------
+        # SLA monitoring (each threshold fires at most once per request)
+        # ----------------------------------------------------------------
+        sla:
+          warning_after_hours: 24
+          escalation_after_hours: 72
+          escalation_recipients:
+            - "data-governance@yourdomain.com"
+
+        # ----------------------------------------------------------------
+        # Access expiry / auto-revocation
+        # ----------------------------------------------------------------
+        expiry:
+          enabled: true
+          revocation_notification: true
+
+        # ----------------------------------------------------------------
+        # Databricks provisioning options
+        # ----------------------------------------------------------------
+        provisioning:
+          grant_method: "sql"     # "sql" (via warehouse) or "sdk" (UC grants API)
+          dry_run: false          # true to log grants without applying them
+
+        # ----------------------------------------------------------------
+        # Catchup window — how far back to scan DataHub for approved requests
+        # ----------------------------------------------------------------
+        lookback_days: 90
+
+        # ----------------------------------------------------------------
+        # Workflow form field IDs — must match your DataHub workflow form.
+        # ----------------------------------------------------------------
+        field_databricks_catalog: "databricks_catalog"
+        field_databricks_schema: "databricks_schema"
+        field_databricks_table: "databricks_table"
+        field_access_duration_days: "access_duration_days"
+        field_requestor_email: "requestor_email"
+        field_justification: "justification"
+
+datahub:
+  server: "https://your-datahub-instance.acryl.io/gms"
+  token: "${DATAHUB_TOKEN}"
+
+# When creating the ingestion source in the DataHub Cloud UI, add the Databricks
+# extras under Step 5 → Advanced → Extra Pip Libraries, e.g.:
+#   ["/datahub-integrations-service", "datahub-action-access-provisioner[databricks]"]
+
+# =============================================================================
+# LOCAL / SELF-HOSTED (development and testing)
+# =============================================================================
+# Replace the source block above with the following and run:
+#   datahub actions -c examples/example_action_databricks.yaml
+#
+# name: access-provisioner-databricks
+#
+# source:
+#   type: "datahub-cloud"
+#   config:
+#     kill_after_idle_timeout: false
+#
+# action:
+#   type: "action-access-provisioner-databricks"
+#   config:
+#     <same config block as action_spec.config above>
+#
+# datahub:
+#   server: "https://your-datahub-instance.acryl.io/gms"
+#   token: "${DATAHUB_TOKEN}"

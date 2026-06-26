@@ -1,6 +1,6 @@
-"""Configuration models for the access provisioner action."""
+from typing import Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class SnowflakeConnectionConfig(BaseModel):
@@ -238,6 +238,218 @@ class AccessProvisionerConfig(BaseModel):
     field_snowflake_role: str = Field(
         default="snowflake_role",
         description="Workflow form field ID that holds the Snowflake role to be granted",
+    )
+    field_access_duration_days: str = Field(
+        default="access_duration_days",
+        description="Workflow form field ID that holds the requested access duration in days",
+    )
+    field_requestor_email: str = Field(
+        default="requestor_email",
+        description="Workflow form field ID that holds the requestor's email address",
+    )
+    field_justification: str = Field(
+        default="justification",
+        description="Workflow form field ID that holds the business justification",
+    )
+
+
+# ===========================================================================
+# Databricks backend
+# ===========================================================================
+
+
+class DatabricksConnectionConfig(BaseModel):
+    """Databricks workspace connection parameters.
+
+    Supports two auth methods:
+      - Personal access token (PAT): set ``token``.
+      - OAuth machine-to-machine (service principal): set ``client_id`` +
+        ``client_secret``.
+
+    A SQL warehouse (``http_path``) is always required: state/log tables are
+    Delta tables, and (when ``grant_method: sql``) GRANT/REVOKE statements run
+    through the warehouse too.
+    """
+
+    host: str = Field(
+        description="Workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com",
+    )
+    http_path: str = Field(
+        description=(
+            "SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123). Required for the "
+            "Delta state/log tables and for SQL-based GRANT/REVOKE."
+        ),
+    )
+    token: str | None = Field(
+        default=None,
+        description="Personal access token (PAT auth)",
+    )
+    client_id: str | None = Field(
+        default=None,
+        description="OAuth service-principal client ID (M2M auth)",
+    )
+    client_secret: str | None = Field(
+        default=None,
+        description="OAuth service-principal client secret (M2M auth)",
+    )
+
+    @model_validator(mode="after")
+    def _require_auth(self) -> "DatabricksConnectionConfig":
+        has_pat = bool(self.token)
+        has_oauth = bool(self.client_id and self.client_secret)
+        if not (has_pat or has_oauth):
+            raise ValueError(
+                "Databricks connection requires either 'token' (PAT) or "
+                "'client_id' + 'client_secret' (OAuth service principal)."
+            )
+        return self
+
+    @property
+    def server_hostname(self) -> str:
+        """Bare hostname (no scheme / trailing slash) for the SQL connector."""
+        return self.host.replace("https://", "").replace("http://", "").rstrip("/")
+
+    def get_sql_connection(self):
+        """Return a live databricks-sql-connector connection."""
+        from databricks import sql  # lazy import — only needed at runtime
+
+        if self.token:
+            return sql.connect(
+                server_hostname=self.server_hostname,
+                http_path=self.http_path,
+                access_token=self.token,
+            )
+
+        # OAuth M2M (service principal) — mint a credentials provider via the SDK.
+        from databricks.sdk.core import Config, oauth_service_principal
+
+        def _credentials_provider():
+            return oauth_service_principal(
+                Config(
+                    host=f"https://{self.server_hostname}",
+                    client_id=self.client_id,
+                    client_secret=self.client_secret,
+                )
+            )
+
+        return sql.connect(
+            server_hostname=self.server_hostname,
+            http_path=self.http_path,
+            credentials_provider=_credentials_provider,
+        )
+
+    def get_workspace_client(self):
+        """Return a databricks-sdk WorkspaceClient (used when grant_method='sdk')."""
+        from databricks.sdk import WorkspaceClient
+
+        if self.token:
+            return WorkspaceClient(host=f"https://{self.server_hostname}", token=self.token)
+        return WorkspaceClient(
+            host=f"https://{self.server_hostname}",
+            client_id=self.client_id,
+            client_secret=self.client_secret,
+        )
+
+
+class DatabricksStateConfig(BaseModel):
+    """Unity Catalog location for the Delta state/log tables.
+
+    Defaults to ``datahub.access_provisioner``. The catalog and schema must
+    already exist (the provisioner role needs CREATE TABLE on the schema); the
+    tables are created on first run.
+    """
+
+    catalog: str = Field(
+        default="datahub",
+        description="Unity Catalog catalog that holds the state/log tables",
+    )
+    schema_name: str = Field(
+        default="access_provisioner",
+        description="Schema that holds the state/log tables",
+        alias="schema",
+    )
+    grants_table: str = Field(
+        default="access_provisioner_grants",
+        description="Delta table tracking every provisioned grant (idempotency + expiry)",
+    )
+    sla_table: str = Field(
+        default="access_provisioner_sla_notifications",
+        description="Delta table tracking sent SLA notifications (dedup across runs)",
+    )
+    errors_table: str = Field(
+        default="access_provisioner_errors",
+        description="Delta table recording permanently-failed provisioning attempts",
+    )
+
+    @property
+    def qualified_grants_table(self) -> str:
+        return f"`{self.catalog}`.`{self.schema_name}`.`{self.grants_table}`"
+
+    @property
+    def qualified_sla_table(self) -> str:
+        return f"`{self.catalog}`.`{self.schema_name}`.`{self.sla_table}`"
+
+    @property
+    def qualified_errors_table(self) -> str:
+        return f"`{self.catalog}`.`{self.schema_name}`.`{self.errors_table}`"
+
+
+class DatabricksProvisioningConfig(BaseModel):
+    """Controls how Databricks GRANT/REVOKE statements are executed."""
+
+    grant_method: Literal["sql", "sdk"] = Field(
+        default="sql",
+        description=(
+            "How to apply grants: 'sql' runs GRANT/REVOKE through the SQL warehouse; "
+            "'sdk' uses the Unity Catalog grants API (databricks-sdk)."
+        ),
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Log GRANT/REVOKE without executing them — useful for testing",
+    )
+
+
+class DatabricksAccessProvisionerConfig(BaseModel):
+    """Top-level configuration for the Databricks Access Provisioner Action."""
+
+    databricks_connection: DatabricksConnectionConfig = Field(
+        description="Databricks workspace connection used to execute grants and store state"
+    )
+    state: DatabricksStateConfig = Field(
+        default_factory=DatabricksStateConfig,
+        description="Unity Catalog location for the Delta state/log tables",
+    )
+    smtp: SmtpConfig = Field(description="Gmail SMTP configuration for email notifications")
+    sla: SlaConfig = Field(
+        default_factory=SlaConfig,
+        description="SLA monitoring and reminder settings",
+    )
+    expiry: ExpiryConfig = Field(
+        default_factory=ExpiryConfig,
+        description="Access expiry / auto-revocation settings",
+    )
+    lookback_days: int = Field(
+        default=90,
+        description="How many days back to scan DataHub for approved requests on each startup pass",
+    )
+    provisioning: DatabricksProvisioningConfig = Field(
+        default_factory=DatabricksProvisioningConfig,
+        description="Options controlling how Databricks grants are executed",
+    )
+
+    # Form field IDs — must match the field IDs defined in the DataHub workflow form.
+    field_databricks_catalog: str = Field(
+        default="databricks_catalog",
+        description="Workflow form field ID that holds the target Unity Catalog catalog",
+    )
+    field_databricks_schema: str = Field(
+        default="databricks_schema",
+        description="Workflow form field ID that holds the target schema (optional)",
+    )
+    field_databricks_table: str = Field(
+        default="databricks_table",
+        description="Workflow form field ID that holds the target table (optional)",
     )
     field_access_duration_days: str = Field(
         default="access_duration_days",

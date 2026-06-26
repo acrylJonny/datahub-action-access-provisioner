@@ -1,5 +1,3 @@
-"""Data models for access request state."""
-
 from dataclasses import dataclass, field
 
 # Status values emitted by DataHub on actionRequestStatus
@@ -16,11 +14,22 @@ ACTION_REQUEST_TYPE_WORKFLOW = "WORKFLOW_FORM_REQUEST"
 
 @dataclass
 class FormFieldValues:
-    """Extracted values from an ActionWorkflowFormRequest's fields list."""
+    """Extracted values from an ActionWorkflowFormRequest's fields list.
+
+    Carries both the Snowflake and Databricks target slots; only the subset that
+    matches the configured backend's form-field IDs will be populated for any
+    given request.
+    """
 
     snowflake_database: str | None = None
     snowflake_schema: str | None = None
     snowflake_role: str | None = None
+    # Databricks Unity Catalog target (catalog.schema.table). platform_instance is
+    # intentionally NOT part of this — targets come straight from the form fields,
+    # so a dataset's platform_instance prefix never affects what gets granted.
+    databricks_catalog: str | None = None
+    databricks_schema: str | None = None
+    databricks_table: str | None = None
     access_duration_days: int | None = None
     requestor_email: str | None = None
     justification: str | None = None
@@ -69,6 +78,29 @@ class GrantRecord:
     snowflake_role: str
     snowflake_database: str
     snowflake_schema: str | None
+    requestor_email: str | None
+    granted_at_ms: int
+    expires_at_ms: int | None
+
+    @property
+    def has_expiry(self) -> bool:
+        return self.expires_at_ms is not None
+
+
+@dataclass
+class DatabricksGrantRecord:
+    """Tracks a Databricks Unity Catalog grant so it can be revoked later.
+
+    The grantee is a Databricks *principal* (the requestor's email / username),
+    not a role — Unity Catalog grants privileges directly to users, groups, or
+    service principals.
+    """
+
+    action_request_urn: str
+    principal: str
+    catalog: str
+    schema: str | None
+    table: str | None
     requestor_email: str | None
     granted_at_ms: int
     expires_at_ms: int | None

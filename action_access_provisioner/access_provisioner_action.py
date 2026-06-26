@@ -1,25 +1,3 @@
-"""DataHub Action: automated Snowflake access provisioning, SLA tracking, and expiry revocation.
-
-Design note — scheduled invocation model
------------------------------------------
-The DataHub Cloud executor kills Actions after ~5 minutes of idle time, so this
-action is designed to be run on a schedule (e.g. every 30 minutes via cron or the
-DataHub scheduler) rather than as a persistent daemon.
-
-On each invocation the action:
-  1. Runs a *catchup pass* at startup:
-       a. Fetches all COMPLETED/APPROVED workflow requests from the last N days.
-       b. Skips any already recorded in the Snowflake state table (idempotent).
-       c. Provisions Snowflake access + sends email for any new approvals.
-       d. Checks every active grant for expiry; revokes + emails if expired.
-       e. Checks every pending request for SLA breaches; emails if not already notified.
-  2. Listens for live MCL events during the remaining ~5-minute window and handles
-     any new status-change events in real time.
-
-All state (provisioned grants, sent SLA notifications) is stored in Snowflake tables
-so it persists across invocations and prevents duplicate actions.
-"""
-
 import logging
 import time
 from typing import Any
