@@ -1,3 +1,4 @@
+import re
 import time
 from unittest.mock import MagicMock
 
@@ -9,6 +10,7 @@ from action_access_provisioner.databricks import (
     ensure_state_tables,
     get_expired_grants,
     is_already_provisioned,
+    is_provisioning_failed,
     is_sla_notified,
     record_grant,
     record_provisioning_error,
@@ -148,3 +150,34 @@ def test_record_provisioning_error_merge(mock_conn, state_config):
     assert "MERGE INTO" in sql
     assert params["urn"] == "urn:li:actionRequest:012"
     assert params["msg"] == "Catalog does not exist"
+
+
+def test_parameterized_sql_uses_pyformat_markers(mock_conn, state_config, grant_with_expiry):
+    # The DataHub Cloud executor pins databricks-sql-connector 2.9.6, which only
+    # binds pyformat (%(name)s) markers — native ":name" markers reach the server
+    # unbound (UNBOUND_SQL_PARAMETER). Every bound param must use %(name)s and no
+    # bare :name marker may slip back in.
+    conn, cursor = mock_conn
+    calls = [
+        lambda: is_already_provisioned(conn, "urn:li:actionRequest:001", state_config),
+        lambda: record_grant(conn, grant_with_expiry, state_config),
+        lambda: get_expired_grants(conn, state_config),
+        lambda: record_revocation(conn, grant_with_expiry, state_config),
+        lambda: is_sla_notified(conn, "urn:li:actionRequest:008", "warning", state_config),
+        lambda: record_sla_notification(
+            conn, "urn:li:actionRequest:009", "escalation", state_config
+        ),
+        lambda: is_provisioning_failed(conn, "urn:li:actionRequest:011", state_config),
+        lambda: record_provisioning_error(
+            conn, "urn:li:actionRequest:012", "X", "boom", state_config
+        ),
+    ]
+    for call in calls:
+        cursor.reset_mock()
+        cursor.fetchone.return_value = (0,)
+        cursor.fetchall.return_value = []
+        call()
+        sql, params = cursor.execute.call_args[0]
+        for key in params:
+            assert f"%({key})s" in sql, f"{key} not bound as pyformat marker in: {sql}"
+        assert not re.search(r"[\s(]:[a-z_]+\b", sql), f"stray :name marker in: {sql}"

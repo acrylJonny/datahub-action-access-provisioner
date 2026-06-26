@@ -333,6 +333,13 @@ class DatabricksConnectionConfig(BaseModel):
         """Return a live databricks-sql-connector connection."""
         from databricks import sql  # lazy import — only needed at runtime
 
+        # The DataHub Cloud executor pins databricks-sql-connector==2.9.6, which
+        # only supports pyformat (%(name)s) parameter markers — it has no native
+        # ":name" binding, so those markers reach the server unbound. Force
+        # pyformat so our state-table queries bind correctly here and on newer
+        # connectors (3.x/4.x default to the "named" paramstyle).
+        sql.paramstyle = "pyformat"
+
         if self.token:
             return sql.connect(
                 server_hostname=self.server_hostname,
@@ -459,25 +466,11 @@ class DatabricksAccessProvisionerConfig(BaseModel):
     )
 
     # Form field IDs — must match the field IDs defined in the DataHub workflow form.
-    field_databricks_catalog: str = Field(
-        default="databricks_catalog",
-        description="Workflow form field ID that holds the target Unity Catalog catalog",
-    )
-    field_databricks_schema: str = Field(
-        default="databricks_schema",
-        description="Workflow form field ID that holds the target schema (optional)",
-    )
-    field_databricks_table: str = Field(
-        default="databricks_table",
-        description="Workflow form field ID that holds the target table (optional)",
-    )
+    # The grant target (catalog.schema.table) is derived from the dataset entity the
+    # request is raised on, so it is intentionally NOT a form field.
     field_access_duration_days: str = Field(
         default="access_duration_days",
         description="Workflow form field ID that holds the requested access duration in days",
-    )
-    field_requestor_email: str = Field(
-        default="requestor_email",
-        description="Workflow form field ID that holds the requestor's email address",
     )
     field_justification: str = Field(
         default="justification",

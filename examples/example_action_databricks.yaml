@@ -13,9 +13,9 @@
 # KEY DIFFERENCES FROM SNOWFLAKE
 # ------------------------------
 #   * The grantee is the requestor's email (a Databricks principal), not a role.
-#   * Targets are catalog.schema.table, read straight from the workflow form
-#     fields — the dataset's platform_instance is NEVER consulted, so a
-#     platform_instance prefix can't change what gets granted.
+#   * The target catalog.schema.table is derived from the dataset the request was
+#     raised on — never from form fields. The dataset's platform_instance prefix
+#     is stripped, so it can't change what gets granted.
 #   * Grants are applied via the SQL warehouse (grant_method: sql) or the Unity
 #     Catalog grants API (grant_method: sdk).
 
@@ -100,12 +100,10 @@ source:
 
         # ----------------------------------------------------------------
         # Workflow form field IDs — must match your DataHub workflow form.
+        # The grant target is derived from the dataset entity, and the principal
+        # from the requestor's corpuser email, so the form only needs these two.
         # ----------------------------------------------------------------
-        field_databricks_catalog: "databricks_catalog"
-        field_databricks_schema: "databricks_schema"
-        field_databricks_table: "databricks_table"
         field_access_duration_days: "access_duration_days"
-        field_requestor_email: "requestor_email"
         field_justification: "justification"
 
 datahub:

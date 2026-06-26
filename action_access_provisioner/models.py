@@ -11,6 +11,16 @@ REQUEST_RESULT_DENIED = "REJECTED"
 # The actionRequestInfo.type value for workflow-form-based requests
 ACTION_REQUEST_TYPE_WORKFLOW = "WORKFLOW_FORM_REQUEST"
 
+_CORPUSER_PREFIX = "urn:li:corpuser:"
+
+
+def corpuser_email_from_urn(requestor_urn: str | None) -> str | None:
+    """Return the email encoded in a corpuser URN, when the id is itself an email."""
+    if not requestor_urn or not requestor_urn.startswith(_CORPUSER_PREFIX):
+        return None
+    urn_id = requestor_urn[len(_CORPUSER_PREFIX) :]
+    return urn_id if "@" in urn_id else None
+
 
 @dataclass
 class FormFieldValues:
@@ -24,12 +34,8 @@ class FormFieldValues:
     snowflake_database: str | None = None
     snowflake_schema: str | None = None
     snowflake_role: str | None = None
-    # Databricks Unity Catalog target (catalog.schema.table). platform_instance is
-    # intentionally NOT part of this — targets come straight from the form fields,
-    # so a dataset's platform_instance prefix never affects what gets granted.
-    databricks_catalog: str | None = None
-    databricks_schema: str | None = None
-    databricks_table: str | None = None
+    # Note: the Databricks backend derives its catalog.schema.table target from the
+    # dataset entity (not form fields), so no Databricks target lives here.
     access_duration_days: int | None = None
     requestor_email: str | None = None
     justification: str | None = None

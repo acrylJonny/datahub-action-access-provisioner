@@ -7,6 +7,7 @@ from action_access_provisioner.databricks import (
     build_grant_statements,
     build_revoke_statements,
     is_permanent_databricks_error,
+    parse_databricks_dataset_urn,
     provision_access,
     revoke_access,
 )
@@ -20,6 +21,38 @@ def sql_conn():
     cursor.close = MagicMock()
     conn.cursor.return_value = cursor
     return conn, cursor
+
+
+# ---------------------------------------------------------------------------
+# Dataset URN parsing — target derivation + platform_instance stripping
+# ---------------------------------------------------------------------------
+
+
+def test_parse_dataset_urn_three_level():
+    urn = "urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)"
+    assert parse_databricks_dataset_urn(urn) == ("prod", "sales", "orders")
+
+
+def test_parse_dataset_urn_strips_platform_instance():
+    # A platform_instance prefix becomes a leading 4th segment — it must be dropped.
+    urn = "urn:li:dataset:(urn:li:dataPlatform:databricks,myinstance.prod.sales.orders,PROD)"
+    assert parse_databricks_dataset_urn(urn) == ("prod", "sales", "orders")
+
+
+def test_parse_dataset_urn_rejects_non_databricks_platform():
+    urn = "urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.table,PROD)"
+    assert parse_databricks_dataset_urn(urn) is None
+
+
+def test_parse_dataset_urn_rejects_non_table_level():
+    # Catalog/schema-only names aren't datasets and can't resolve to a UC table grant.
+    urn = "urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales,PROD)"
+    assert parse_databricks_dataset_urn(urn) is None
+
+
+def test_parse_dataset_urn_handles_garbage():
+    assert parse_databricks_dataset_urn(None) is None
+    assert parse_databricks_dataset_urn("urn:li:corpuser:alice@example.com") is None
 
 
 # ---------------------------------------------------------------------------

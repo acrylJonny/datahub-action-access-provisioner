@@ -27,6 +27,7 @@ from action_access_provisioner.models import (
     AccessRequest,
     DatabricksGrantRecord,
     PendingRequestSummary,
+    corpuser_email_from_urn,
 )
 
 logger = logging.getLogger(__name__)
@@ -188,20 +189,26 @@ class DatabricksAccessProvisionerAction(Action):
     # ------------------------------------------------------------------
 
     def _provision(self, request: AccessRequest) -> None:
-        ff = request.form_fields
         principal = self._resolve_principal(request)
-        catalog = ff.databricks_catalog
+        # The grant target (catalog.schema.table) is derived from the dataset the
+        # request was raised on — never from form fields — so it always matches the
+        # entity and any platform_instance prefix is stripped (see the parser).
+        target = dbx.parse_databricks_dataset_urn(request.resource)
 
-        if not principal or not catalog:
+        if not principal or target is None:
             logger.error(
-                f"[Provision] Request {request.urn} missing required fields "
-                f"(principal={principal!r}, catalog={catalog!r}) — skipping"
+                f"[Provision] Request {request.urn} cannot be provisioned "
+                f"(principal={principal!r}, resource={request.resource!r}) — skipping"
             )
+            if principal and request.resource and target is None:
+                # A non-Databricks-dataset entity can never resolve to a UC target;
+                # record a permanent failure so we don't retry it every catchup.
+                self._record_invalid_target(request)
             return
 
+        catalog, schema, table = target
         logger.info(
-            f"[Provision] principal={principal} catalog={catalog} "
-            f"schema={ff.databricks_schema!r} table={ff.databricks_table!r} "
+            f"[Provision] principal={principal} target={catalog}.{schema}.{table} "
             f"for request {request.urn}"
         )
 
@@ -212,28 +219,29 @@ class DatabricksAccessProvisionerAction(Action):
                 workspace_client=self._get_workspace_client(),
                 principal=principal,
                 catalog=catalog,
-                schema=ff.databricks_schema,
-                table=ff.databricks_table,
+                schema=schema,
+                table=table,
                 provisioning=self.config.provisioning,
             )
             logger.info(f"[Provision] {len(statements)} grant(s) applied for {request.urn}")
         except Exception as exc:
             logger.error(f"[Provision] Databricks error for {request.urn}: {exc}", exc_info=True)
-            self._handle_provision_failure(conn, request, exc)
+            self._handle_provision_failure(conn, request, exc, principal, catalog, schema, table)
             return
 
         expires_at_ms: int | None = None
-        if ff.access_duration_days:
-            expires_at_ms = int(time.time() * 1000) + ff.access_duration_days * 86_400_000
+        if request.form_fields.access_duration_days:
+            expires_at_ms = (
+                int(time.time() * 1000) + request.form_fields.access_duration_days * 86_400_000
+            )
 
         grant = DatabricksGrantRecord(
             action_request_urn=request.urn,
             principal=principal,
             catalog=catalog,
-            schema=ff.databricks_schema,
-            table=ff.databricks_table,
-            requestor_email=ff.requestor_email
-            or self._extract_requestor_email(request.requestor_urn),
+            schema=schema,
+            table=table,
+            requestor_email=principal,
             granted_at_ms=int(time.time() * 1000),
             expires_at_ms=expires_at_ms,
         )
@@ -243,11 +251,43 @@ class DatabricksAccessProvisionerAction(Action):
             logger.error(f"[Provision] Failed to record grant state for {request.urn}: {exc}")
 
         try:
-            send_dbx_approval_notification(self.config.smtp, request, statements)
+            send_dbx_approval_notification(
+                self.config.smtp,
+                request,
+                statements,
+                principal=principal,
+                catalog=catalog,
+                schema=schema,
+                table=table,
+            )
         except Exception as exc:
             logger.error(f"[Provision] Failed to send approval email: {exc}")
 
-    def _handle_provision_failure(self, conn: Any, request: AccessRequest, exc: Exception) -> None:
+    def _record_invalid_target(self, request: AccessRequest) -> None:
+        try:
+            conn = self._get_sql_conn()
+            dbx.record_provisioning_error(
+                conn,
+                request.urn,
+                "INVALID_TARGET",
+                f"Cannot derive a Databricks catalog.schema.table from entity {request.resource}",
+                self.config.state,
+            )
+        except Exception as exc:
+            logger.error(
+                f"[Provision] Failed to record invalid-target state for {request.urn}: {exc}"
+            )
+
+    def _handle_provision_failure(
+        self,
+        conn: Any,
+        request: AccessRequest,
+        exc: Exception,
+        principal: str,
+        catalog: str,
+        schema: str,
+        table: str,
+    ) -> None:
         if not dbx.is_permanent_databricks_error(exc):
             return
         already_notified = False
@@ -261,7 +301,15 @@ class DatabricksAccessProvisionerAction(Action):
             logger.error(f"[Provision] Failed to record error state for {request.urn}: {rec_exc}")
         if not already_notified:
             try:
-                send_dbx_provisioning_failure_notification(self.config.smtp, request, str(exc))
+                send_dbx_provisioning_failure_notification(
+                    self.config.smtp,
+                    request,
+                    str(exc),
+                    principal=principal,
+                    catalog=catalog,
+                    schema=schema,
+                    table=table,
+                )
             except Exception as mail_exc:
                 logger.error(
                     f"[Provision] Failed to send failure notification for {request.urn}: {mail_exc}"
@@ -316,35 +364,17 @@ class DatabricksAccessProvisionerAction(Action):
     # ------------------------------------------------------------------
 
     def _field_id_map(self) -> dict[str, str]:
+        # The grant target comes from the dataset entity, so only the remaining
+        # form fields (duration, justification) need mapping here.
         return {
-            "field_databricks_catalog": self.config.field_databricks_catalog,
-            "field_databricks_schema": self.config.field_databricks_schema,
-            "field_databricks_table": self.config.field_databricks_table,
             "field_access_duration_days": self.config.field_access_duration_days,
-            "field_requestor_email": self.config.field_requestor_email,
             "field_justification": self.config.field_justification,
         }
 
-    def _resolve_principal(self, request: AccessRequest) -> str | None:
-        """The Databricks principal is always the requestor's email.
-
-        Prefer the explicit ``requestor_email`` form field; fall back to the
-        requestor's corpuser URN identity when it is an email address.
-        """
-        if request.form_fields.requestor_email:
-            return request.form_fields.requestor_email
-        return self._extract_requestor_email(request.requestor_urn)
-
     @staticmethod
-    def _extract_requestor_email(requestor_urn: str | None) -> str | None:
-        if not requestor_urn:
-            return None
-        prefix = "urn:li:corpuser:"
-        if requestor_urn.startswith(prefix):
-            urn_id = requestor_urn[len(prefix) :]
-            if "@" in urn_id:
-                return urn_id
-        return None
+    def _resolve_principal(request: AccessRequest) -> str | None:
+        """The Databricks principal is the requestor's corpuser email identity."""
+        return corpuser_email_from_urn(request.requestor_urn)
 
     def _get_sql_conn(self) -> Any:
         if self._sql_conn is None:

@@ -6,7 +6,12 @@ from email.mime.text import MIMEText
 from importlib import resources
 
 from action_access_provisioner.config import SmtpConfig
-from action_access_provisioner.models import AccessRequest, DatabricksGrantRecord, GrantRecord
+from action_access_provisioner.models import (
+    AccessRequest,
+    DatabricksGrantRecord,
+    GrantRecord,
+    corpuser_email_from_urn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -124,7 +129,10 @@ def send_denial_notification(
     request: AccessRequest,
 ) -> None:
     """Notify the requestor that their access request has been denied."""
-    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    recipient = request.form_fields.requestor_email or corpuser_email_from_urn(
+        request.requestor_urn
+    )
+    to = [recipient] if recipient else []
     html = _render(
         "denial.html",
         heading_color="#dc3545",
@@ -241,9 +249,14 @@ def send_dbx_approval_notification(
     smtp_config: SmtpConfig,
     request: AccessRequest,
     sql_statements: list[str],
+    *,
+    principal: str,
+    catalog: str,
+    schema: str | None,
+    table: str | None,
 ) -> None:
     """Notify the requestor that their Databricks access has been provisioned."""
-    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    to = [principal] if principal else []
     ff = request.form_fields
     note = request.note or ""
     note_row = (
@@ -257,8 +270,8 @@ def send_dbx_approval_notification(
         heading_color="#28a745",
         heading="Access Request Approved",
         resource=request.resource or "—",
-        target=_dbx_target_label(ff.databricks_catalog, ff.databricks_schema, ff.databricks_table),
-        granted_to=ff.requestor_email or "—",
+        target=_dbx_target_label(catalog, schema, table),
+        granted_to=principal or "—",
         duration=f"{ff.access_duration_days} days" if ff.access_duration_days else "Indefinite",
         note_row=note_row,
         sql_block=_sql_block(sql_statements),
@@ -270,22 +283,26 @@ def send_dbx_provisioning_failure_notification(
     smtp_config: SmtpConfig,
     request: AccessRequest,
     error_message: str,
+    *,
+    principal: str,
+    catalog: str,
+    schema: str | None,
+    table: str | None,
 ) -> None:
     """Notify the requestor that Databricks provisioning failed permanently."""
-    to = [request.form_fields.requestor_email] if request.form_fields.requestor_email else []
+    to = [principal] if principal else []
     if not to:
         logger.warning(
             f"[Email] No requestor email for {request.urn} — skipping failure notification"
         )
         return
 
-    ff = request.form_fields
     html = _render(
         "dbx_provisioning_failure.html",
         heading_color="#fd7e14",
         heading="Access Provisioning Failed",
         resource=request.resource or "—",
-        target=_dbx_target_label(ff.databricks_catalog, ff.databricks_schema, ff.databricks_table),
+        target=_dbx_target_label(catalog, schema, table),
         error_message=error_message,
         urn=request.urn,
     )

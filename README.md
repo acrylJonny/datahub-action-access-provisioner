@@ -304,29 +304,33 @@ pip install -e ".[databricks]"   # databricks-sql-connector + databricks-sdk
 ### How grants work
 
 The grantee is the **requestor's email** (a Databricks principal — user, group,
-or service principal), resolved from the `requestor_email` form field (falling
-back to the requestor's corpuser identity). Targets come straight from the form
-fields, so the statements applied for a `catalog` / `catalog.schema` /
-`catalog.schema.table` request are:
+or service principal), resolved from the requestor's corpuser identity. The
+target is **derived from the dataset the request was raised on** — never from
+form fields — so the `catalog.schema.table` always matches the entity:
 
 ```sql
 GRANT USE CATALOG ON CATALOG `catalog` TO `user@example.com`;
 GRANT USE SCHEMA  ON SCHEMA  `catalog`.`schema` TO `user@example.com`;
-GRANT SELECT      ON {CATALOG|SCHEMA|TABLE} ... TO `user@example.com`;
+GRANT SELECT      ON TABLE   `catalog`.`schema`.`table` TO `user@example.com`;
 ```
 
 Revocation only removes `SELECT` at the granted level — the navigation-only
 `USE CATALOG` / `USE SCHEMA` privileges are left in place so revoking one grant
 never breaks the principal's unrelated access elsewhere in the catalog.
 
-### platform_instance is never consulted
+The workflow form therefore only collects `justification` and an optional
+`access_duration_days` — there are no catalog/schema/table or email fields.
 
-Targets are read **only** from the workflow form fields, not parsed from the
-approved dataset's URN. A Databricks dataset ingested with a `platform_instance`
+### platform_instance is stripped
+
+The target is parsed from the approved dataset's URN, always taking the trailing
+`catalog.schema.table`. A Databricks dataset ingested with a `platform_instance`
 has a URN like
 `urn:li:dataset:(urn:li:dataPlatform:databricks,<instance>.catalog.schema.table,PROD)`,
-but the provisioner ignores that entirely — so a `platform_instance` prefix can
-never change which Unity Catalog object gets granted.
+and the leading `<instance>` segment is dropped — so a `platform_instance` prefix
+can never change which Unity Catalog object gets granted. A request raised on a
+non-Databricks dataset (which can't resolve to a UC object) is recorded as a
+permanent `INVALID_TARGET` failure rather than retried.
 
 ### Connection & auth
 

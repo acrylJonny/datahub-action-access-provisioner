@@ -35,6 +35,36 @@ def _ident(name: str) -> str:
     return f"`{name}`"
 
 
+# Dataset URN: urn:li:dataset:(urn:li:dataPlatform:<platform>,<name>,<env>)
+_DATASET_URN_RE = re.compile(
+    r"^urn:li:dataset:\(urn:li:dataPlatform:(?P<platform>[^,]+),(?P<name>.+),(?P<env>[^,)]+)\)$"
+)
+
+
+def parse_databricks_dataset_urn(urn: str | None) -> tuple[str, str, str] | None:
+    """Extract ``(catalog, schema, table)`` from a Databricks dataset URN.
+
+    The Unity Catalog dataset name is ``catalog.schema.table``. When a
+    ``platform_instance`` is configured it is prepended as a leading segment
+    (``<instance>.<catalog>.<schema>.<table>``) — we always take the trailing
+    three segments so the instance is stripped and never affects the grant.
+
+    Returns ``None`` for non-Databricks datasets or names that aren't at least
+    three-level (e.g. catalog- or schema-only containers, which aren't datasets).
+
+    ponytail: splits the name on ``.`` — a Unity Catalog identifier that itself
+    contains a literal dot (only possible when backtick-quoted) would mis-split.
+    Such names are not emitted by DataHub's UC ingestion, so this is acceptable.
+    """
+    m = _DATASET_URN_RE.match(urn or "")
+    if not m or m.group("platform") != "databricks":
+        return None
+    parts = m.group("name").split(".")
+    if len(parts) < 3:
+        return None
+    return parts[-3], parts[-2], parts[-1]
+
+
 def _principal(name: str) -> str:
     """Validate and backtick-quote a Databricks principal (user/group/SP)."""
     if not name or not _PRINCIPAL_RE.match(name):
@@ -252,7 +282,7 @@ def is_already_provisioned(conn, action_request_urn: str, state: DatabricksState
     """Return True if this request URN's grant is still active (not revoked)."""
     sql = (
         f"SELECT COUNT(*) FROM {state.qualified_grants_table} "
-        f"WHERE latest_action_request_urn = :urn AND revoked_at_ms IS NULL"
+        f"WHERE latest_action_request_urn = %(urn)s AND revoked_at_ms IS NULL"
     )
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
@@ -266,25 +296,25 @@ def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfi
     table_key = grant.table or TABLE_ALL
 
     # Inline NULL when there is no expiry so we never bind an untyped NULL param.
-    expires_expr = ":expires" if grant.expires_at_ms is not None else "NULL"
+    expires_expr = "%(expires)s" if grant.expires_at_ms is not None else "NULL"
     sql = f"""
         MERGE INTO {state.qualified_grants_table} AS t
-        USING (SELECT :grantee AS grantee, :catalog AS dbx_catalog,
-                      :schema AS dbx_schema, :tbl AS dbx_table) AS s
+        USING (SELECT %(grantee)s AS grantee, %(catalog)s AS dbx_catalog,
+                      %(schema)s AS dbx_schema, %(tbl)s AS dbx_table) AS s
             ON  t.grantee     = s.grantee
             AND t.dbx_catalog = s.dbx_catalog
             AND t.dbx_schema  = s.dbx_schema
             AND t.dbx_table   = s.dbx_table
         WHEN MATCHED THEN UPDATE SET
-            latest_action_request_urn = :urn,
-            requestor_email           = :email,
-            granted_at_ms             = :granted,
+            latest_action_request_urn = %(urn)s,
+            requestor_email           = %(email)s,
+            granted_at_ms             = %(granted)s,
             expires_at_ms             = {expires_expr},
             revoked_at_ms             = NULL
         WHEN NOT MATCHED THEN INSERT
             (grantee, dbx_catalog, dbx_schema, dbx_table,
              latest_action_request_urn, requestor_email, granted_at_ms, expires_at_ms, revoked_at_ms)
-            VALUES (:grantee, :catalog, :schema, :tbl, :urn, :email, :granted, {expires_expr}, NULL)
+            VALUES (%(grantee)s, %(catalog)s, %(schema)s, %(tbl)s, %(urn)s, %(email)s, %(granted)s, {expires_expr}, NULL)
     """
     params: dict[str, Any] = {
         "grantee": grant.principal,
@@ -313,7 +343,7 @@ def get_expired_grants(conn, state: DatabricksStateConfig) -> list[DatabricksGra
         f"SELECT latest_action_request_urn, grantee, dbx_catalog, dbx_schema, dbx_table, "
         f"requestor_email, granted_at_ms, expires_at_ms "
         f"FROM {state.qualified_grants_table} "
-        f"WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= :now AND revoked_at_ms IS NULL"
+        f"WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= %(now)s AND revoked_at_ms IS NULL"
     )
     grants: list[DatabricksGrantRecord] = []
     with _cursor(conn) as cur:
@@ -340,9 +370,9 @@ def record_revocation(conn, grant: DatabricksGrantRecord, state: DatabricksState
     schema_key = grant.schema or SCHEMA_ALL
     table_key = grant.table or TABLE_ALL
     sql = (
-        f"UPDATE {state.qualified_grants_table} SET revoked_at_ms = :now "
-        f"WHERE grantee = :grantee AND dbx_catalog = :catalog "
-        f"AND dbx_schema = :schema AND dbx_table = :tbl"
+        f"UPDATE {state.qualified_grants_table} SET revoked_at_ms = %(now)s "
+        f"WHERE grantee = %(grantee)s AND dbx_catalog = %(catalog)s "
+        f"AND dbx_schema = %(schema)s AND dbx_table = %(tbl)s"
     )
     with _cursor(conn) as cur:
         cur.execute(
@@ -366,7 +396,7 @@ def is_sla_notified(
     """Return True if this SLA notification has already been sent."""
     sql = (
         f"SELECT COUNT(*) FROM {state.qualified_sla_table} "
-        f"WHERE action_request_urn = :urn AND notification_type = :ntype"
+        f"WHERE action_request_urn = %(urn)s AND notification_type = %(ntype)s"
     )
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn, "ntype": notification_type})
@@ -380,11 +410,11 @@ def record_sla_notification(
     """Record a sent SLA notification (idempotent via MERGE)."""
     sql = f"""
         MERGE INTO {state.qualified_sla_table} AS t
-        USING (SELECT :urn AS action_request_urn, :ntype AS notification_type) AS s
+        USING (SELECT %(urn)s AS action_request_urn, %(ntype)s AS notification_type) AS s
             ON t.action_request_urn = s.action_request_urn
             AND t.notification_type = s.notification_type
         WHEN NOT MATCHED THEN INSERT (action_request_urn, notification_type, sent_at_ms)
-            VALUES (:urn, :ntype, :now)
+            VALUES (%(urn)s, %(ntype)s, %(now)s)
     """
     with _cursor(conn) as cur:
         cur.execute(
@@ -431,7 +461,7 @@ def is_permanent_databricks_error(exc: Exception) -> bool:
 
 def is_provisioning_failed(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
     """Return True if this request URN has a recorded permanent failure."""
-    sql = f"SELECT COUNT(*) FROM {state.qualified_errors_table} WHERE action_request_urn = :urn"
+    sql = f"SELECT COUNT(*) FROM {state.qualified_errors_table} WHERE action_request_urn = %(urn)s"
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
         row = cur.fetchone()
@@ -448,10 +478,10 @@ def record_provisioning_error(
     """Record a permanent provisioning failure so the request is not retried."""
     sql = f"""
         MERGE INTO {state.qualified_errors_table} AS t
-        USING (SELECT :urn AS action_request_urn) AS s
+        USING (SELECT %(urn)s AS action_request_urn) AS s
             ON t.action_request_urn = s.action_request_urn
         WHEN NOT MATCHED THEN INSERT (action_request_urn, error_code, error_message, failed_at_ms)
-            VALUES (:urn, :code, :msg, :now)
+            VALUES (%(urn)s, %(code)s, %(msg)s, %(now)s)
     """
     with _cursor(conn) as cur:
         cur.execute(

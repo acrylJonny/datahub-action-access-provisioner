@@ -69,33 +69,30 @@ def test_create_calls_startup_catchup(base_config_dict, mock_pipeline_context):
         action.close()
 
 
-def test_provision_grants_to_requestor_email_and_records(base_config_dict, mock_pipeline_context):
+def test_provision_derives_target_from_entity_and_records(base_config_dict, mock_pipeline_context):
     action = _create_action(base_config_dict, mock_pipeline_context)
     request = _make_request(
-        FormFieldValues(
-            databricks_catalog="prod",
-            databricks_schema="sales",
-            requestor_email="alice@example.com",
-            access_duration_days=30,
-        )
+        FormFieldValues(access_duration_days=30),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
     )
 
     with (
         patch(f"{_ACTION_MODULE}.dbx.get_sql_connection", return_value=MagicMock()),
         patch(
             f"{_ACTION_MODULE}.dbx.provision_access",
-            return_value=["GRANT SELECT ON SCHEMA `prod`.`sales` TO `alice@example.com`"],
+            return_value=["GRANT SELECT ON TABLE `prod`.`sales`.`orders` TO `alice@example.com`"],
         ) as mock_provision,
         patch(f"{_ACTION_MODULE}.dbx.record_grant") as mock_record,
         patch(f"{_ACTION_MODULE}.send_dbx_approval_notification"),
     ):
         action._provision(request)
 
-        # Principal is the requestor email; catalog/schema come from the form.
+        # Principal is the requestor's corpuser email; target comes from the entity.
         kwargs = mock_provision.call_args.kwargs
         assert kwargs["principal"] == "alice@example.com"
         assert kwargs["catalog"] == "prod"
         assert kwargs["schema"] == "sales"
+        assert kwargs["table"] == "orders"
 
         grant = mock_record.call_args[0][1]
         assert isinstance(grant, DatabricksGrantRecord)
@@ -105,19 +102,14 @@ def test_provision_grants_to_requestor_email_and_records(base_config_dict, mock_
     action.close()
 
 
-def test_provision_ignores_platform_instance_in_resource_urn(
+def test_provision_strips_platform_instance_from_resource_urn(
     base_config_dict, mock_pipeline_context
 ):
-    """The target must come from form fields, never parsed from the dataset URN —
-    so a platform_instance prefix on the resource has no effect on the grant."""
+    """A platform_instance prefix on the dataset name is stripped: only the trailing
+    catalog.schema.table is granted, so the instance never affects the grant."""
     action = _create_action(base_config_dict, mock_pipeline_context)
     request = _make_request(
-        FormFieldValues(
-            databricks_catalog="prod",
-            databricks_schema="sales",
-            databricks_table="orders",
-            requestor_email="alice@example.com",
-        ),
+        FormFieldValues(),
         # Dataset URN carries a platform_instance ('myinstance') prefix.
         resource="urn:li:dataset:(urn:li:dataPlatform:databricks,myinstance.prod.sales.orders,PROD)",
     )
@@ -131,30 +123,38 @@ def test_provision_ignores_platform_instance_in_resource_urn(
         action._provision(request)
         kwargs = mock_provision.call_args.kwargs
         assert kwargs["catalog"] == "prod"  # not 'myinstance'
+        assert kwargs["schema"] == "sales"
         assert kwargs["table"] == "orders"
 
     action.close()
 
 
-def test_provision_skips_when_no_catalog(base_config_dict, mock_pipeline_context):
+def test_provision_records_invalid_target_for_non_databricks_entity(
+    base_config_dict, mock_pipeline_context
+):
     action = _create_action(base_config_dict, mock_pipeline_context)
-    request = _make_request(FormFieldValues(requestor_email="alice@example.com"))
+    request = _make_request(
+        FormFieldValues(),
+        resource="urn:li:dataset:(urn:li:dataPlatform:snowflake,db.schema.table,PROD)",
+    )
 
     with (
         patch(f"{_ACTION_MODULE}.dbx.get_sql_connection", return_value=MagicMock()),
         patch(f"{_ACTION_MODULE}.dbx.provision_access") as mock_provision,
+        patch(f"{_ACTION_MODULE}.dbx.record_provisioning_error") as mock_record_err,
     ):
         action._provision(request)
         mock_provision.assert_not_called()
+        assert mock_record_err.call_args[0][2] == "INVALID_TARGET"
 
     action.close()
 
 
 def test_provision_principal_falls_back_to_corpuser_email(base_config_dict, mock_pipeline_context):
     action = _create_action(base_config_dict, mock_pipeline_context)
-    # No requestor_email form field; the corpuser URN identity is an email.
     request = _make_request(
-        FormFieldValues(databricks_catalog="prod"),
+        FormFieldValues(),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
         requestor="urn:li:corpuser:bob@example.com",
     )
 
@@ -210,7 +210,7 @@ def test_denied_request_sends_denial_email(base_config_dict, mock_pipeline_conte
         requestor_urn="urn:li:corpuser:bob@example.com",
         created_ms=int(time.time() * 1000),
         due_date_ms=None,
-        form_fields=FormFieldValues(databricks_catalog="prod", databricks_schema="hr"),
+        form_fields=FormFieldValues(),
     )
 
     with (

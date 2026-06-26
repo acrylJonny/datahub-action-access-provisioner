@@ -2,7 +2,12 @@ import logging
 
 from pydantic import BaseModel, Field
 
-from action_access_provisioner.models import AccessRequest, FormFieldValues, PendingRequestSummary
+from action_access_provisioner.models import (
+    AccessRequest,
+    FormFieldValues,
+    PendingRequestSummary,
+    corpuser_email_from_urn,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -117,9 +122,6 @@ class GqlWorkflowFormRequest(BaseModel):
             snowflake_database=_get("field_snowflake_database"),
             snowflake_schema=_get("field_snowflake_schema"),
             snowflake_role=_get("field_snowflake_role"),
-            databricks_catalog=_get("field_databricks_catalog"),
-            databricks_schema=_get("field_databricks_schema"),
-            databricks_table=_get("field_databricks_table"),
             access_duration_days=duration_int,
             requestor_email=_get("field_requestor_email"),
             justification=_get("field_justification"),
@@ -179,11 +181,12 @@ class GqlActionRequest(BaseModel):
     def to_pending_summary(self, config_field_ids: dict[str, str]) -> PendingRequestSummary:
         """Convert to the domain PendingRequestSummary dataclass."""
         form_fields = self._form_fields(config_field_ids)
+        requestor_urn = self.created.actor.urn if self.created.actor else None
         return PendingRequestSummary(
             urn=self.urn,
             created_ms=self.created.time,
-            requestor_urn=self.created.actor.urn if self.created.actor else None,
-            requestor_email=form_fields.requestor_email,
+            requestor_urn=requestor_urn,
+            requestor_email=form_fields.requestor_email or corpuser_email_from_urn(requestor_urn),
             resource=self.entity.urn if self.entity else None,
             assigned_users=self.assignedUsers,
             assigned_groups=self.assignedGroups,
