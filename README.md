@@ -115,7 +115,7 @@ When creating the ingestion source in the DataHub Cloud UI, go to **Step 5 → A
 and add the following under **Extra Pip Libraries**:
 
 ```json
-["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.3/datahub_action_access_provisioner-0.1.3-py3-none-any.whl"]
+["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.15/datahub_action_access_provisioner-0.1.15-py3-none-any.whl"]
 ```
 
 Update the wheel URL to point to the [latest release](https://github.com/acrylJonny/datahub-action-access-provisioner/releases)
