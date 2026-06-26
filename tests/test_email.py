@@ -16,7 +16,15 @@ from action_access_provisioner.models import AccessRequest, FormFieldValues, Gra
 
 @pytest.fixture
 def smtp_config():
-    return SmtpConfig(username="sender@gmail.com", password="app-password")
+    return SmtpConfig(username="noreply@example.com", password="app-password")
+
+
+def test_smtp_config_resend_requires_from_address():
+    # Resend's username is the literal "resend", so a sender address is mandatory.
+    with pytest.raises(ValueError):
+        SmtpConfig(username="resend", password="re_xxx")
+    cfg = SmtpConfig(username="resend", password="re_xxx", from_address="noreply@example.com")
+    assert cfg.get_from_address() == "noreply@example.com"
 
 
 @pytest.fixture

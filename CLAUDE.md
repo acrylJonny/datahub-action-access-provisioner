@@ -135,7 +135,7 @@ All GRANT/REVOKE statements are logged before execution. Set `provisioning.dry_r
 
 ### Email Notifications
 
-`email.py` sends four notification types via Gmail SMTP:
+`email.py` sends notification emails via SMTP (defaults target Resend):
 
 | Function | Trigger |
 |---|---|
@@ -155,7 +155,7 @@ All config lives in `examples/example_action.yaml`. Key sections:
 |---|---|
 | `snowflake_connection` | `account_id`, `username`, `password`, `role` (must have GRANT OPTION) |
 | `state` | `database`, `schema` — where state tables are created |
-| `smtp` | `host`, `port`, `username`, `password` (Gmail App Password) |
+| `smtp` | `host`, `port`, `username`, `password` (Resend API key), `from_address` |
 | `sla` | `warning_after_hours` (24), `escalation_after_hours` (72), `escalation_recipients` |
 | `expiry` | `enabled` (true), `revocation_notification` (true) |
 | `provisioning` | `default_warehouse`, `dry_run` |

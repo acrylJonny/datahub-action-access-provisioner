@@ -29,7 +29,7 @@ def base_config_dict():
             "token": "dapiXXXX",
         },
         "state": {"catalog": "test_cat", "schema": "ap_state"},
-        "smtp": {"username": "sender@gmail.com", "password": "app-password"},
+        "smtp": {"username": "noreply@example.com", "password": "app-password"},
         "provisioning": {"dry_run": True, "grant_method": "sql"},
     }
 

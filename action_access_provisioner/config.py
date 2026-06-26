@@ -66,22 +66,42 @@ class SnowflakeConnectionConfig(BaseModel):
 
 
 class SmtpConfig(BaseModel):
-    """Gmail SMTP configuration for sending email notifications."""
+    """SMTP configuration for sending email notifications.
 
-    host: str = Field(default="smtp.gmail.com", description="SMTP server hostname")
+    Defaults target Resend (https://resend.com); override host/username/port for
+    any other SMTP provider.
+    """
+
+    host: str = Field(default="smtp.resend.com", description="SMTP server hostname")
     port: int = Field(default=587, description="SMTP server port (587 for TLS, 465 for SSL)")
-    username: str = Field(description="Gmail address used to send emails")
-    password: str = Field(
-        description="Gmail App Password (generate at myaccount.google.com/apppasswords)"
+    username: str = Field(
+        default="resend",
+        description="SMTP username — Resend uses the literal string 'resend'",
     )
+    password: str = Field(description="SMTP password — for Resend this is your API key (re_...)")
     from_address: str | None = Field(
         default=None,
-        description="Sender display address — defaults to username if not set",
+        description=(
+            "Sender address. Required for Resend (must be a verified domain sender, e.g. "
+            "'DataHub <noreply@yourdomain.com>'); for providers where the username is the "
+            "sender email it defaults to the username."
+        ),
     )
     use_tls: bool = Field(
         default=True,
         description="Use STARTTLS (port 587). Set False only when using implicit SSL (port 465).",
     )
+
+    @model_validator(mode="after")
+    def _require_from_address_for_non_email_username(self) -> "SmtpConfig":
+        # Resend's username is the literal "resend", so the From cannot fall back
+        # to it — a verified sender address must be supplied explicitly.
+        if self.from_address is None and "@" not in self.username:
+            raise ValueError(
+                f"from_address is required when username ({self.username!r}) is not an email "
+                "address — set it to a verified sender (e.g. 'noreply@yourdomain.com')"
+            )
+        return self
 
     def get_from_address(self) -> str:
         return self.from_address or self.username
@@ -205,7 +225,7 @@ class AccessProvisionerConfig(BaseModel):
             "notifications across scheduled runs. Defaults to DATAHUB.ACCESS_PROVISIONER."
         ),
     )
-    smtp: SmtpConfig = Field(description="Gmail SMTP configuration for email notifications")
+    smtp: SmtpConfig = Field(description="SMTP configuration for email notifications")
     sla: SlaConfig = Field(
         default_factory=SlaConfig,
         description="SLA monitoring and reminder settings",
@@ -420,7 +440,7 @@ class DatabricksAccessProvisionerConfig(BaseModel):
         default_factory=DatabricksStateConfig,
         description="Unity Catalog location for the Delta state/log tables",
     )
-    smtp: SmtpConfig = Field(description="Gmail SMTP configuration for email notifications")
+    smtp: SmtpConfig = Field(description="SMTP configuration for email notifications")
     sla: SlaConfig = Field(
         default_factory=SlaConfig,
         description="SLA monitoring and reminder settings",

@@ -54,7 +54,7 @@ def base_config_dict():
             "schema": "AP_STATE",
         },
         "smtp": {
-            "username": "sender@gmail.com",
+            "username": "noreply@example.com",
             "password": "app-password",
         },
         "provisioning": {

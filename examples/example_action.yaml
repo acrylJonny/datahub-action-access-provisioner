@@ -68,13 +68,15 @@ source:
           sla_table: "ACCESS_PROVISIONER_SLA_NOTIFICATIONS"  # default
 
         # ----------------------------------------------------------------
-        # Gmail SMTP (outbound email notifications)
+        # SMTP (outbound email notifications) — defaults target Resend.
+        # For Resend: username is the literal "resend", password is your API
+        # key, and from_address MUST be a verified domain sender.
         # ----------------------------------------------------------------
         smtp:
-          host: "smtp.gmail.com"
+          host: "smtp.resend.com"
           port: 587
-          username: "datahub-noreply@yourdomain.com"
-          password: "${GMAIL_APP_PASSWORD}"   # Google App Password
+          username: "resend"
+          password: "${RESEND_API_KEY}"
           from_address: "DataHub Access Bot <datahub-noreply@yourdomain.com>"
           use_tls: true
 

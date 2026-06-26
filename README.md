@@ -38,7 +38,7 @@ AccessProvisionerAction.act()
         │     GRANT SELECT ON ALL/FUTURE TABLES IN SCHEMA …
         │     GRANT USAGE ON WAREHOUSE …
         │
-        └─► send approval email (Gmail SMTP)
+        └─► send approval email (SMTP)
 
 Background threads (always running):
   ┌─ SLA Monitor (every N hours)
@@ -58,8 +58,9 @@ Background threads (always running):
 - `acryl-datahub >= 1.0.0`
 - A Snowflake account — the configured user/role must have `GRANT OPTION` on
   the databases/schemas you intend to provision.
-- A Gmail account with an [App Password](https://myaccount.google.com/apppasswords)
-  (2FA must be enabled on the Google account).
+- An SMTP provider for outbound email. Defaults target [Resend](https://resend.com)
+  (username `resend`, password = your API key, and a verified domain sender for
+  `from_address`); any SMTP server works by overriding `host`/`username`/`port`.
 
 ## Installation
 
@@ -101,10 +102,11 @@ source:
           warehouse: "COMPUTE_WH"
           role: "SYSADMIN"               # Must have GRANT OPTION privilege
         smtp:
-          host: "smtp.gmail.com"
+          host: "smtp.resend.com"
           port: 587
-          username: "noreply@yourdomain.com"
-          password: "${GMAIL_APP_PASSWORD}"
+          username: "resend"
+          password: "${RESEND_API_KEY}"
+          from_address: "DataHub <noreply@yourdomain.com>"   # verified Resend sender
           use_tls: true
 datahub:
   server: "https://your-datahub-instance.acryl.io/gms"
@@ -115,7 +117,7 @@ When creating the ingestion source in the DataHub Cloud UI, go to **Step 5 → A
 and add the following under **Extra Pip Libraries**:
 
 ```json
-["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.15/datahub_action_access_provisioner-0.1.15-py3-none-any.whl"]
+["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.16/datahub_action_access_provisioner-0.1.16-py3-none-any.whl"]
 ```
 
 Update the wheel URL to point to the [latest release](https://github.com/acrylJonny/datahub-action-access-provisioner/releases)
@@ -142,10 +144,11 @@ action:
       warehouse: "COMPUTE_WH"
       role: "SYSADMIN"
     smtp:
-      host: "smtp.gmail.com"
+      host: "smtp.resend.com"
       port: 587
-      username: "noreply@yourdomain.com"
-      password: "${GMAIL_APP_PASSWORD}"
+      username: "resend"
+      password: "${RESEND_API_KEY}"
+      from_address: "DataHub <noreply@yourdomain.com>"   # verified Resend sender
       use_tls: true
 datahub:
   server: "https://your-datahub-instance.acryl.io/gms"
@@ -177,7 +180,7 @@ Use the local (`datahub-cloud` source) configuration from the minimal example ab
 ```bash
 # Set required env vars
 export SNOWFLAKE_PASSWORD="..."
-export GMAIL_APP_PASSWORD="..."
+export RESEND_API_KEY="..."
 export DATAHUB_TOKEN="..."
 
 # Run the action

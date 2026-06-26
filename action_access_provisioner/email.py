@@ -20,7 +20,7 @@ def _send(
     html_body: str,
     cc_addresses: list[str] | None = None,
 ) -> None:
-    """Send an HTML email via Gmail SMTP."""
+    """Send an HTML email via SMTP."""
     if not to_addresses:
         logger.warning(f"No recipients provided for email subject='{subject}' — skipping")
         return
