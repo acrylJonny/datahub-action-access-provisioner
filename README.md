@@ -321,6 +321,80 @@ never breaks the principal's unrelated access elsewhere in the catalog.
 The workflow form therefore only collects `justification` and an optional
 `access_duration_days` — there are no catalog/schema/table or email fields.
 
+### Group-based access
+
+By default the grantee is the requestor's own identity. For more scalable access
+management you can route a request through a **Databricks group** instead: add a
+form field (default ID `databricks_group`, configurable via
+`field_databricks_group`) and set `field_databricks_group` in the config. When the
+field is empty the action always falls back to the individual requestor.
+
+`provisioning.group_access_mode` selects what supplying a group means:
+
+- `grant` (default) — the object is granted **`TO <group>`**; expiry/revocation
+  operate on the group's grant.
+- `membership` — the requestor is **added as a member of the group** (the group
+  already holds the relevant grants) via the SCIM groups API, and removed again on
+  expiry. No object grant is issued. This is the IdP-reconcilable pattern: group
+  membership can be managed/audited centrally (e.g. against Entra ID), giving a
+  second layer that survives a user leaving. Membership changes always go through
+  the SDK regardless of `grant_method`, and are tracked in a dedicated
+  `access_provisioner_group_memberships` Delta table.
+
+Notifications (approval, failure, expiry) always go to the human who raised the
+request, never to the group.
+
+### Ticketing (Jira / ServiceNow)
+
+Some teams fulfil access through their ITSM tool. Add an optional `ticketing`
+block to open a ticket on approval:
+
+- `mode: augment` — grant access in Databricks **and** file a ticket (hand-off /
+  audit trail). Idempotent for free: a ticket is only filed when a fresh grant is
+  applied.
+- `mode: replace` — **skip the grant** and only file a ticket for a human to
+  fulfil. The recorded state row carries no expiry (nothing to auto-revoke), and
+  if the ticket call fails nothing is recorded so the next catchup retries.
+
+Both Jira (basic auth with an API token, requires `jira_project_key`) and
+ServiceNow (basic auth, configurable `servicenow_table`) are supported. See the
+commented `ticketing:` block in the example recipe.
+
+### DataHub access mirror (auditing)
+
+Enable `datahub_sync` to mirror the access the action grants back into DataHub
+using the native [`role`](https://docs.datahub.com/docs/generated/metamodel/entities/role)
+entity, giving a queryable **"who has access"** audit view:
+
+```yaml
+datahub_sync:
+  enabled: true # off by default
+  role_urn_prefix: databricks # role URNs: urn:li:role:databricks.<group>
+  platform: databricks
+  env: PROD # must match how the datasets were ingested
+  request_url: https://your-datahub/... # optional, surfaced on the role
+```
+
+What gets written:
+
+- a Databricks group `analytics` becomes a role `urn:li:role:databricks.analytics`
+  (`roleProperties` + `actors`);
+- **group grants** add a `RoleAssociation` to the granted dataset's `access` aspect,
+  so the dataset shows which roles can reach it;
+- **membership** changes (membership mode) record the individual user on the role's
+  `actors.users`, and expiry removes them again.
+
+This is a strictly **read-only mirror of Unity Catalog** — editing DataHub never
+mutates Databricks. It does not require the `SHOW_ACCESS_MANAGEMENT` UI tab; the
+value is in the queryable metadata. Errors in the mirror are logged and swallowed
+so they can never affect provisioning.
+
+> **Scope.** Only access the action itself issues is mirrored, and only group grants
+> are role-modelled today (individual user grants and the full policy structured
+> properties are a follow-up). Mirroring pre-existing, out-of-band Unity Catalog
+> access (a UC-wide `SHOW GRANTS` reconciliation crawl) is a separate, larger piece
+> not yet implemented.
+
 ### platform_instance is stripped
 
 The target is parsed from the approved dataset's URN, always taking the trailing

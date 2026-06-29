@@ -27,6 +27,7 @@ def field_id_map() -> dict[str, str]:
         "field_access_duration_days": "access_duration_days",
         "field_requestor_email": "requestor_email",
         "field_justification": "justification",
+        "field_databricks_group": "databricks_group",
     }
 
 
@@ -159,6 +160,14 @@ def test_to_form_field_values_invalid_duration_falls_back_to_none(field_id_map):
     )
     ff = wf.to_form_field_values(field_id_map)
     assert ff.access_duration_days is None
+
+
+def test_to_form_field_values_parses_optional_databricks_group(field_id_map):
+    wf = GqlWorkflowFormRequest.model_validate(
+        {"fields": [_str_field("databricks_group", "analytics_team")]}
+    )
+    ff = wf.to_form_field_values(field_id_map)
+    assert ff.databricks_group == "analytics_team"
 
 
 # ---------------------------------------------------------------------------

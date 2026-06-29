@@ -9,13 +9,9 @@ from action_access_provisioner.config import (
     SnowflakeProvisioningConfig,
     StateConfig,
 )
-from action_access_provisioner.constants import (
-    DDL_ERRORS_TABLE,
-    DDL_GRANTS_TABLE,
-    DDL_SLA_TABLE,
-    SCHEMA_ALL,
-)
 from action_access_provisioner.models import GrantRecord
+from action_access_provisioner.sql.snowflake import dcl, ddl, dml
+from action_access_provisioner.sql.snowflake.ddl import SCHEMA_ALL
 
 logger = logging.getLogger(__name__)
 
@@ -45,7 +41,7 @@ def get_user_default_role(conn, username: str) -> str | None:
     """
     with _cursor(conn) as cur:
         try:
-            cur.execute(f'DESCRIBE USER "{username}"')
+            cur.execute(dml.DESCRIBE_USER.format(username=username))
             for row in cur.fetchall():
                 # DESCRIBE USER returns rows of (property, value, default)
                 if row[0] == "DEFAULT_ROLE" and row[1]:
@@ -63,7 +59,7 @@ def grant_role_to_role(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """GRANT <target_role> TO ROLE <grantee_role>."""
-    statement = f"GRANT ROLE {target_role} TO ROLE {grantee_role}"
+    statement = dcl.GRANT_ROLE_TO_ROLE.format(target_role=target_role, grantee_role=grantee_role)
     _execute(conn, statement, provisioning)
 
 
@@ -74,7 +70,7 @@ def grant_database_usage(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """GRANT USAGE ON DATABASE <database> TO ROLE <role>."""
-    statement = f"GRANT USAGE ON DATABASE {database} TO ROLE {role}"
+    statement = dcl.GRANT_DATABASE_USAGE.format(database=database, role=role)
     _execute(conn, statement, provisioning)
 
 
@@ -86,7 +82,7 @@ def grant_schema_usage(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """GRANT USAGE ON SCHEMA <database>.<schema> TO ROLE <role>."""
-    statement = f"GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {role}"
+    statement = dcl.GRANT_SCHEMA_USAGE.format(database=database, schema=schema, role=role)
     _execute(conn, statement, provisioning)
 
 
@@ -98,9 +94,11 @@ def grant_schema_select(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """GRANT SELECT ON ALL TABLES IN SCHEMA <database>.<schema> TO ROLE <role>."""
-    statement = f"GRANT SELECT ON ALL TABLES IN SCHEMA {database}.{schema} TO ROLE {role}"
+    statement = dcl.GRANT_SCHEMA_SELECT_ALL.format(database=database, schema=schema, role=role)
     _execute(conn, statement, provisioning)
-    future_statement = f"GRANT SELECT ON FUTURE TABLES IN SCHEMA {database}.{schema} TO ROLE {role}"
+    future_statement = dcl.GRANT_SCHEMA_SELECT_FUTURE.format(
+        database=database, schema=schema, role=role
+    )
     _execute(conn, future_statement, provisioning)
 
 
@@ -111,7 +109,7 @@ def grant_warehouse_usage(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """GRANT USAGE ON WAREHOUSE <warehouse> TO ROLE <role>."""
-    statement = f"GRANT USAGE ON WAREHOUSE {warehouse} TO ROLE {role}"
+    statement = dcl.GRANT_WAREHOUSE_USAGE.format(warehouse=warehouse, role=role)
     _execute(conn, statement, provisioning)
 
 
@@ -122,7 +120,7 @@ def revoke_database_usage(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """REVOKE USAGE ON DATABASE <database> FROM ROLE <role>."""
-    statement = f"REVOKE USAGE ON DATABASE {database} FROM ROLE {role}"
+    statement = dcl.REVOKE_DATABASE_USAGE.format(database=database, role=role)
     _execute(conn, statement, provisioning)
 
 
@@ -134,7 +132,7 @@ def revoke_schema_usage(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """REVOKE USAGE ON SCHEMA <database>.<schema> FROM ROLE <role>."""
-    statement = f"REVOKE USAGE ON SCHEMA {database}.{schema} FROM ROLE {role}"
+    statement = dcl.REVOKE_SCHEMA_USAGE.format(database=database, schema=schema, role=role)
     _execute(conn, statement, provisioning)
 
 
@@ -146,10 +144,10 @@ def revoke_schema_select(
     provisioning: SnowflakeProvisioningConfig,
 ) -> None:
     """REVOKE SELECT ON ALL TABLES IN SCHEMA from role."""
-    statement = f"REVOKE SELECT ON ALL TABLES IN SCHEMA {database}.{schema} FROM ROLE {role}"
+    statement = dcl.REVOKE_SCHEMA_SELECT_ALL.format(database=database, schema=schema, role=role)
     _execute(conn, statement, provisioning)
-    future_statement = (
-        f"REVOKE SELECT ON FUTURE TABLES IN SCHEMA {database}.{schema} FROM ROLE {role}"
+    future_statement = dcl.REVOKE_SCHEMA_SELECT_FUTURE.format(
+        database=database, schema=schema, role=role
     )
     _execute(conn, future_statement, provisioning)
 
@@ -170,27 +168,29 @@ def provision_access(
     statements: list[str] = []
 
     grant_database_usage(conn, database, role, provisioning)
-    statements.append(f"GRANT USAGE ON DATABASE {database} TO ROLE {role}")
+    statements.append(dcl.GRANT_DATABASE_USAGE.format(database=database, role=role))
 
     if schema:
         grant_schema_usage(conn, database, schema, role, provisioning)
-        statements.append(f"GRANT USAGE ON SCHEMA {database}.{schema} TO ROLE {role}")
+        statements.append(
+            dcl.GRANT_SCHEMA_USAGE.format(database=database, schema=schema, role=role)
+        )
         grant_schema_select(conn, database, schema, role, provisioning)
         statements.append(
-            f"GRANT SELECT ON ALL/FUTURE TABLES IN SCHEMA {database}.{schema} TO ROLE {role}"
+            dcl.GRANT_SCHEMA_SELECT_SUMMARY.format(database=database, schema=schema, role=role)
         )
     else:
         # No schema specified — grant at the database level
-        all_schemas = f"GRANT USAGE ON ALL SCHEMAS IN DATABASE {database} TO ROLE {role}"
+        all_schemas = dcl.GRANT_ALL_SCHEMAS_USAGE.format(database=database, role=role)
         _execute(conn, all_schemas, provisioning)
         statements.append(all_schemas)
-        future_schemas = f"GRANT USAGE ON FUTURE SCHEMAS IN DATABASE {database} TO ROLE {role}"
+        future_schemas = dcl.GRANT_FUTURE_SCHEMAS_USAGE.format(database=database, role=role)
         _execute(conn, future_schemas, provisioning)
         statements.append(future_schemas)
 
     if warehouse:
         grant_warehouse_usage(conn, warehouse, role, provisioning)
-        statements.append(f"GRANT USAGE ON WAREHOUSE {warehouse} TO ROLE {role}")
+        statements.append(dcl.GRANT_WAREHOUSE_USAGE.format(warehouse=warehouse, role=role))
 
     return statements
 
@@ -216,8 +216,11 @@ def revoke_access(
             provisioning,
         )
         statements.append(
-            f"REVOKE SELECT ON ALL/FUTURE TABLES IN SCHEMA "
-            f"{grant.snowflake_database}.{grant.snowflake_schema} FROM ROLE {grant.snowflake_role}"
+            dcl.REVOKE_SCHEMA_SELECT_SUMMARY.format(
+                database=grant.snowflake_database,
+                schema=grant.snowflake_schema,
+                role=grant.snowflake_role,
+            )
         )
         revoke_schema_usage(
             conn,
@@ -227,13 +230,18 @@ def revoke_access(
             provisioning,
         )
         statements.append(
-            f"REVOKE USAGE ON SCHEMA {grant.snowflake_database}.{grant.snowflake_schema} "
-            f"FROM ROLE {grant.snowflake_role}"
+            dcl.REVOKE_SCHEMA_USAGE.format(
+                database=grant.snowflake_database,
+                schema=grant.snowflake_schema,
+                role=grant.snowflake_role,
+            )
         )
 
     revoke_database_usage(conn, grant.snowflake_database, grant.snowflake_role, provisioning)
     statements.append(
-        f"REVOKE USAGE ON DATABASE {grant.snowflake_database} FROM ROLE {grant.snowflake_role}"
+        dcl.REVOKE_DATABASE_USAGE.format(
+            database=grant.snowflake_database, role=grant.snowflake_role
+        )
     )
 
     return statements
@@ -283,9 +291,9 @@ def _execute(
 def ensure_state_tables(conn, state: StateConfig) -> None:
     """Create the grants, SLA-notification, and errors tracking tables if they don't already exist."""
     with _cursor(conn) as cur:
-        cur.execute(DDL_GRANTS_TABLE.format(table=state.qualified_grants_table))
-        cur.execute(DDL_SLA_TABLE.format(table=state.qualified_sla_table))
-        cur.execute(DDL_ERRORS_TABLE.format(table=state.qualified_errors_table))
+        cur.execute(ddl.GRANTS_TABLE.format(table=state.qualified_grants_table))
+        cur.execute(ddl.SLA_TABLE.format(table=state.qualified_sla_table))
+        cur.execute(ddl.ERRORS_TABLE.format(table=state.qualified_errors_table))
     logger.info(
         f"[State] State tables ready: {state.qualified_grants_table}, "
         f"{state.qualified_sla_table}, {state.qualified_errors_table}"
@@ -301,10 +309,7 @@ def is_already_provisioned(conn, action_request_urn: str, state: StateConfig) ->
     different URN and will therefore return False — which is the correct behaviour
     since the MERGE in record_grant() will update the existing row in place.
     """
-    sql = (
-        f"SELECT COUNT(*) FROM {state.qualified_grants_table} "
-        f"WHERE LATEST_ACTION_REQUEST_URN = %s AND REVOKED_AT IS NULL"
-    )
+    sql = dml.COUNT_ACTIVE_GRANT.format(table=state.qualified_grants_table)
     with _cursor(conn) as cur:
         cur.execute(sql, (action_request_urn,))
         row = cur.fetchone()
@@ -334,23 +339,7 @@ def record_grant(conn, grant: GrantRecord, state: StateConfig) -> None:
         "%Y-%m-%d %H:%M:%S"
     )
     expires_expr = "%s::TIMESTAMP_NTZ" if expires_str else "NULL"
-    sql = f"""
-        MERGE INTO {state.qualified_grants_table} AS target
-        USING (SELECT %s AS role, %s AS db, %s AS schema) AS source
-            ON  target.SNOWFLAKE_ROLE      = source.role
-            AND target.SNOWFLAKE_DATABASE  = source.db
-            AND target.SNOWFLAKE_SCHEMA    = source.schema
-        WHEN MATCHED THEN UPDATE SET
-            LATEST_ACTION_REQUEST_URN = %s,
-            REQUESTOR_EMAIL           = %s,
-            GRANTED_AT                = %s::TIMESTAMP_NTZ,
-            EXPIRES_AT                = {expires_expr},
-            REVOKED_AT                = NULL
-        WHEN NOT MATCHED THEN INSERT
-            (SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, SNOWFLAKE_SCHEMA,
-             LATEST_ACTION_REQUEST_URN, REQUESTOR_EMAIL, GRANTED_AT, EXPIRES_AT)
-        VALUES (%s, %s, %s, %s, %s, %s::TIMESTAMP_NTZ, {expires_expr})
-    """
+    sql = dml.MERGE_GRANT.format(table=state.qualified_grants_table, expires_expr=expires_expr)
     # WHEN MATCHED SET params: URN, email, granted_at (+ optional expires).
     # role/db/schema are NOT included here — they belong only in the USING clause.
     common = [
@@ -387,12 +376,7 @@ def record_grant(conn, grant: GrantRecord, state: StateConfig) -> None:
 
 def get_expired_grants(conn, state: StateConfig) -> list[GrantRecord]:
     """Return all grants whose EXPIRES_AT is in the past and have not yet been revoked."""
-    sql = (
-        f"SELECT LATEST_ACTION_REQUEST_URN, SNOWFLAKE_ROLE, SNOWFLAKE_DATABASE, "
-        f"SNOWFLAKE_SCHEMA, REQUESTOR_EMAIL, GRANTED_AT, EXPIRES_AT "
-        f"FROM {state.qualified_grants_table} "
-        f"WHERE EXPIRES_AT <= CURRENT_TIMESTAMP() AND REVOKED_AT IS NULL"
-    )
+    sql = dml.SELECT_EXPIRED_GRANTS.format(table=state.qualified_grants_table)
     grants: list[GrantRecord] = []
     with _cursor(conn) as cur:
         cur.execute(sql)
@@ -416,11 +400,7 @@ def get_expired_grants(conn, state: StateConfig) -> list[GrantRecord]:
 def record_revocation(conn, grant: GrantRecord, state: StateConfig) -> None:
     """Mark the grant row as revoked, keyed on the natural access combo."""
     schema_key = grant.snowflake_schema or SCHEMA_ALL
-    sql = (
-        f"UPDATE {state.qualified_grants_table} "
-        f"SET REVOKED_AT = CURRENT_TIMESTAMP() "
-        f"WHERE SNOWFLAKE_ROLE = %s AND SNOWFLAKE_DATABASE = %s AND SNOWFLAKE_SCHEMA = %s"
-    )
+    sql = dml.UPDATE_REVOKE_GRANT.format(table=state.qualified_grants_table)
     with _cursor(conn) as cur:
         cur.execute(sql, (grant.snowflake_role, grant.snowflake_database, schema_key))
     logger.debug(
@@ -432,10 +412,7 @@ def is_sla_notified(
     conn, action_request_urn: str, notification_type: str, state: StateConfig
 ) -> bool:
     """Return True if this SLA notification has already been sent."""
-    sql = (
-        f"SELECT COUNT(*) FROM {state.qualified_sla_table} "
-        f"WHERE ACTION_REQUEST_URN = %s AND NOTIFICATION_TYPE = %s"
-    )
+    sql = dml.COUNT_SLA_NOTIFIED.format(table=state.qualified_sla_table)
     with _cursor(conn) as cur:
         cur.execute(sql, (action_request_urn, notification_type))
         row = cur.fetchone()
@@ -446,15 +423,7 @@ def record_sla_notification(
     conn, action_request_urn: str, notification_type: str, state: StateConfig
 ) -> None:
     """Record that an SLA notification has been sent."""
-    sql = (
-        f"INSERT INTO {state.qualified_sla_table} "
-        f"(ACTION_REQUEST_URN, NOTIFICATION_TYPE, SENT_AT) "
-        f"SELECT %s, %s, CURRENT_TIMESTAMP() "
-        f"WHERE NOT EXISTS ("
-        f"  SELECT 1 FROM {state.qualified_sla_table} "
-        f"  WHERE ACTION_REQUEST_URN = %s AND NOTIFICATION_TYPE = %s"
-        f")"
-    )
+    sql = dml.INSERT_SLA_NOTIFICATION.format(table=state.qualified_sla_table)
     with _cursor(conn) as cur:
         cur.execute(
             sql, (action_request_urn, notification_type, action_request_urn, notification_type)

@@ -122,6 +122,7 @@ class GqlWorkflowFormRequest(BaseModel):
             snowflake_database=_get("field_snowflake_database"),
             snowflake_schema=_get("field_snowflake_schema"),
             snowflake_role=_get("field_snowflake_role"),
+            databricks_group=_get("field_databricks_group"),
             access_duration_days=duration_int,
             requestor_email=_get("field_requestor_email"),
             justification=_get("field_justification"),

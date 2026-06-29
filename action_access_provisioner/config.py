@@ -1,3 +1,4 @@
+from enum import Enum
 from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -407,6 +408,10 @@ class DatabricksStateConfig(BaseModel):
         default="access_provisioner_errors",
         description="Delta table recording permanently-failed provisioning attempts",
     )
+    memberships_table: str = Field(
+        default="access_provisioner_group_memberships",
+        description="Delta table tracking group-membership grants (membership access model)",
+    )
 
     @property
     def qualified_grants_table(self) -> str:
@@ -420,6 +425,86 @@ class DatabricksStateConfig(BaseModel):
     def qualified_errors_table(self) -> str:
         return f"`{self.catalog}`.`{self.schema_name}`.`{self.errors_table}`"
 
+    @property
+    def qualified_memberships_table(self) -> str:
+        return f"`{self.catalog}`.`{self.schema_name}`.`{self.memberships_table}`"
+
+
+class TicketProvider(str, Enum):
+    JIRA = "jira"
+    SERVICENOW = "servicenow"
+
+
+class TicketingMode(str, Enum):
+    AUGMENT = "augment"
+    REPLACE = "replace"
+
+
+class TicketingConfig(BaseModel):
+    """Optional Jira / ServiceNow ticketing target.
+
+    Some organisations fulfil access through their ITSM tool rather than (or in
+    addition to) a direct grant. When configured, the action opens a ticket on
+    approval:
+
+      - ``mode: augment`` — grant access *and* file a ticket (audit / hand-off).
+      - ``mode: replace`` — do not grant; only file a ticket for a human to fulfil.
+    """
+
+    provider: TicketProvider = Field(
+        description="Ticketing system to open access tickets in",
+    )
+    mode: TicketingMode = Field(
+        default=TicketingMode.AUGMENT,
+        description=(
+            "'augment': grant access and also open a ticket. "
+            "'replace': skip the grant and only open a ticket for manual fulfilment."
+        ),
+    )
+    base_url: str = Field(
+        description=(
+            "Base URL of the ticketing instance, e.g. https://yourco.atlassian.net "
+            "(Jira) or https://yourco.service-now.com (ServiceNow)."
+        ),
+    )
+    username: str = Field(
+        description="Auth user — the account email for Jira, the username for ServiceNow",
+    )
+    api_token: str = Field(
+        description="API token (Jira) or password (ServiceNow) for basic auth",
+    )
+    jira_project_key: str | None = Field(
+        default=None,
+        description="Jira project key the issue is created under (required for provider='jira')",
+    )
+    jira_issue_type: str = Field(
+        default="Task",
+        description="Jira issue type name to create",
+    )
+    servicenow_table: str = Field(
+        default="incident",
+        description="ServiceNow table to insert the record into (e.g. 'incident', 'sc_request')",
+    )
+    dry_run: bool = Field(
+        default=False,
+        description="Log the ticket payload but do not call the ticketing API",
+    )
+
+    @model_validator(mode="after")
+    def _require_provider_fields(self) -> "TicketingConfig":
+        if self.provider == TicketProvider.JIRA and not self.jira_project_key:
+            raise ValueError("jira_project_key is required when provider='jira'")
+        return self
+
+    @property
+    def base_url_clean(self) -> str:
+        return self.base_url.rstrip("/")
+
+
+class GroupAccessMode(str, Enum):
+    GRANT = "grant"
+    MEMBERSHIP = "membership"
+
 
 class DatabricksProvisioningConfig(BaseModel):
     """Controls how Databricks GRANT/REVOKE statements are executed."""
@@ -431,9 +516,56 @@ class DatabricksProvisioningConfig(BaseModel):
             "'sdk' uses the Unity Catalog grants API (databricks-sdk)."
         ),
     )
+    group_access_mode: GroupAccessMode = Field(
+        default=GroupAccessMode.GRANT,
+        description=(
+            "How a requested group is honoured. 'grant': GRANT the object to the group. "
+            "'membership': add the requestor as a member of the group (the group already "
+            "holds the grants) — added/removed via the SDK and reconcilable with the IdP. "
+            "Only applies when the request supplies a group; otherwise access is granted to "
+            "the requestor's own identity."
+        ),
+    )
     dry_run: bool = Field(
         default=False,
         description="Log GRANT/REVOKE without executing them — useful for testing",
+    )
+
+
+class DatahubSyncConfig(BaseModel):
+    """Mirror granted Databricks access into DataHub for auditing.
+
+    When enabled, every group grant / membership change the action makes is also
+    written back to DataHub as ``role`` + ``actors`` + dataset ``access`` aspects,
+    giving a queryable "who has access" view. This is a strictly read-only mirror of
+    Databricks — editing DataHub never mutates Unity Catalog.
+    """
+
+    enabled: bool = Field(
+        default=False,
+        description=(
+            "Mirror group grants and memberships into DataHub as role/actors/access "
+            "aspects. Off by default; turn on once you want the audit view."
+        ),
+    )
+    role_urn_prefix: str = Field(
+        default="databricks",
+        description=(
+            "Prefix for minted role URNs. A Databricks group 'analytics' becomes "
+            "urn:li:role:<prefix>.analytics."
+        ),
+    )
+    platform: str = Field(
+        default="databricks",
+        description="Data platform used when building dataset URNs for access associations",
+    )
+    env: str = Field(
+        default="PROD",
+        description="Fabric/env used when building dataset URNs (must match how datasets were ingested)",
+    )
+    request_url: str | None = Field(
+        default=None,
+        description="Optional link surfaced on roleProperties.requestUrl (e.g. the access-request workflow)",
     )
 
 
@@ -464,6 +596,20 @@ class DatabricksAccessProvisionerConfig(BaseModel):
         default_factory=DatabricksProvisioningConfig,
         description="Options controlling how Databricks grants are executed",
     )
+    ticketing: TicketingConfig | None = Field(
+        default=None,
+        description=(
+            "Optional Jira/ServiceNow ticketing target. When set, a ticket is opened on "
+            "approval (in addition to, or instead of, the grant — see ticketing.mode)."
+        ),
+    )
+    datahub_sync: DatahubSyncConfig = Field(
+        default_factory=DatahubSyncConfig,
+        description=(
+            "Mirror granted access back into DataHub as role/actors/access aspects for "
+            "auditing. Off by default."
+        ),
+    )
 
     # Form field IDs — must match the field IDs defined in the DataHub workflow form.
     # The grant target (catalog.schema.table) is derived from the dataset entity the
@@ -475,4 +621,12 @@ class DatabricksAccessProvisionerConfig(BaseModel):
     field_justification: str = Field(
         default="justification",
         description="Workflow form field ID that holds the business justification",
+    )
+    field_databricks_group: str = Field(
+        default="databricks_group",
+        description=(
+            "Workflow form field ID that holds an optional Databricks group name. When the "
+            "form supplies a value, access is granted to that group (group-based access) "
+            "rather than to the requestor's individual identity."
+        ),
     )

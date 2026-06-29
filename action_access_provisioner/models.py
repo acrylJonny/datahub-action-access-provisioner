@@ -1,4 +1,4 @@
-from dataclasses import dataclass, field
+from pydantic import BaseModel, Field
 
 # Status values emitted by DataHub on actionRequestStatus
 REQUEST_STATUS_PENDING = "PENDING"
@@ -22,8 +22,7 @@ def corpuser_email_from_urn(requestor_urn: str | None) -> str | None:
     return urn_id if "@" in urn_id else None
 
 
-@dataclass
-class FormFieldValues:
+class FormFieldValues(BaseModel):
     """Extracted values from an ActionWorkflowFormRequest's fields list.
 
     Carries both the Snowflake and Databricks target slots; only the subset that
@@ -35,17 +34,19 @@ class FormFieldValues:
     snowflake_schema: str | None = None
     snowflake_role: str | None = None
     # Note: the Databricks backend derives its catalog.schema.table target from the
-    # dataset entity (not form fields), so no Databricks target lives here.
+    # dataset entity (not form fields), so no Databricks target lives here. The
+    # optional group routes the grant to a Databricks group (group-based access)
+    # instead of the requestor's individual identity.
+    databricks_group: str | None = None
     access_duration_days: int | None = None
     requestor_email: str | None = None
     justification: str | None = None
 
     # Raw field map in case callers want non-standard fields
-    raw: dict[str, str] = field(default_factory=dict)
+    raw: dict[str, str] = Field(default_factory=dict)
 
 
-@dataclass
-class AccessRequest:
+class AccessRequest(BaseModel):
     """Parsed representation of a DataHub ActionRequest for access provisioning."""
 
     urn: str
@@ -76,8 +77,7 @@ class AccessRequest:
         return self.status == REQUEST_STATUS_PENDING
 
 
-@dataclass
-class GrantRecord:
+class GrantRecord(BaseModel):
     """Tracks a Snowflake grant that was executed so it can be revoked later."""
 
     action_request_urn: str
@@ -93,8 +93,7 @@ class GrantRecord:
         return self.expires_at_ms is not None
 
 
-@dataclass
-class DatabricksGrantRecord:
+class DatabricksGrantRecord(BaseModel):
     """Tracks a Databricks Unity Catalog grant so it can be revoked later.
 
     The grantee is a Databricks *principal* (the requestor's email / username),
@@ -105,7 +104,8 @@ class DatabricksGrantRecord:
     action_request_urn: str
     principal: str
     catalog: str
-    schema: str | None
+    # 'schema_name' rather than 'schema' to avoid shadowing pydantic BaseModel.schema.
+    schema_name: str | None
     table: str | None
     requestor_email: str | None
     granted_at_ms: int
@@ -116,8 +116,26 @@ class DatabricksGrantRecord:
         return self.expires_at_ms is not None
 
 
-@dataclass
-class PendingRequestSummary:
+class DatabricksGroupMembershipRecord(BaseModel):
+    """Tracks a Databricks group membership grant so it can be removed on expiry.
+
+    Used by the 'membership' group-access model: instead of granting an object to
+    a principal, the requestor (``user_email``) is added to ``group_name`` — the
+    group already holds the relevant Unity Catalog grants.
+    """
+
+    action_request_urn: str
+    user_email: str
+    group_name: str
+    added_at_ms: int
+    expires_at_ms: int | None
+
+    @property
+    def has_expiry(self) -> bool:
+        return self.expires_at_ms is not None
+
+
+class PendingRequestSummary(BaseModel):
     """Summary of a pending request returned from the DataHub GraphQL search."""
 
     urn: str
@@ -125,5 +143,5 @@ class PendingRequestSummary:
     requestor_urn: str | None
     requestor_email: str | None
     resource: str | None
-    assigned_users: list[str] = field(default_factory=list)
-    assigned_groups: list[str] = field(default_factory=list)
+    assigned_users: list[str] = Field(default_factory=list)
+    assigned_groups: list[str] = Field(default_factory=list)

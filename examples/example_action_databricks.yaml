@@ -92,6 +92,41 @@ source:
         provisioning:
           grant_method: "sql"     # "sql" (via warehouse) or "sdk" (UC grants API)
           dry_run: false          # true to log grants without applying them
+          # How a requested group (field_databricks_group) is honoured:
+          #   "grant"      — GRANT the object TO the group (default)
+          #   "membership" — add the requestor as a member of the group (the group
+          #                  already holds the grants); removed again on expiry.
+          #                  Always uses the SDK; IdP-reconcilable (e.g. Entra ID).
+          # group_access_mode: "grant"
+
+        # ----------------------------------------------------------------
+        # Optional: open a Jira / ServiceNow ticket on approval.
+        #   mode: augment  -> grant access AND file a ticket (audit / hand-off)
+        #   mode: replace  -> skip the grant; only file a ticket for manual fulfilment
+        # Omit this block entirely to provision in Databricks only.
+        # ----------------------------------------------------------------
+        # ticketing:
+        #   provider: "jira"                 # "jira" or "servicenow"
+        #   mode: "augment"
+        #   base_url: "https://yourco.atlassian.net"
+        #   username: "svc-account@yourco.com"
+        #   api_token: "${TICKETING_API_TOKEN}"
+        #   jira_project_key: "ACCESS"       # required for provider: jira
+        #   jira_issue_type: "Task"
+        #   # servicenow_table: "incident"   # for provider: servicenow
+        #   dry_run: false
+
+        # ----------------------------------------------------------------
+        # Optional: mirror granted access back into DataHub as role/actors/access
+        # aspects for a queryable "who has access" audit view. Read-only mirror of
+        # Unity Catalog — editing DataHub never changes Databricks.
+        # ----------------------------------------------------------------
+        # datahub_sync:
+        #   enabled: true              # off by default
+        #   role_urn_prefix: "databricks"   # role URNs: urn:li:role:databricks.<group>
+        #   platform: "databricks"
+        #   env: "PROD"                # must match how the datasets were ingested
+        #   # request_url: "https://your-datahub/..."  # optional link on the role
 
         # ----------------------------------------------------------------
         # Catchup window — how far back to scan DataHub for approved requests
@@ -101,10 +136,15 @@ source:
         # ----------------------------------------------------------------
         # Workflow form field IDs — must match your DataHub workflow form.
         # The grant target is derived from the dataset entity, and the principal
-        # from the requestor's corpuser email, so the form only needs these two.
+        # from the requestor's corpuser email, so the form only needs these.
+        # Add field_databricks_group only if you offer group-based access.
         # ----------------------------------------------------------------
         field_access_duration_days: "access_duration_days"
         field_justification: "justification"
+        # Optional: a form field holding a Databricks group to grant to instead of
+        # the individual requestor (group-based access). Leave the form field empty
+        # to grant to the requestor's own identity.
+        # field_databricks_group: "databricks_group"
 
 datahub:
   server: "https://your-datahub-instance.acryl.io/gms"

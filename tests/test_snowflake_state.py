@@ -5,7 +5,6 @@ from unittest.mock import MagicMock
 import pytest
 
 from action_access_provisioner.config import StateConfig
-from action_access_provisioner.constants import SCHEMA_ALL as _SCHEMA_ALL
 from action_access_provisioner.models import GrantRecord
 from action_access_provisioner.snowflake import (
     ensure_state_tables,
@@ -19,6 +18,7 @@ from action_access_provisioner.snowflake import (
     record_revocation,
     record_sla_notification,
 )
+from action_access_provisioner.sql.snowflake.ddl import SCHEMA_ALL as _SCHEMA_ALL
 
 
 @pytest.fixture

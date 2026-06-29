@@ -9,6 +9,7 @@ from action_access_provisioner.config import SmtpConfig
 from action_access_provisioner.models import (
     AccessRequest,
     DatabricksGrantRecord,
+    DatabricksGroupMembershipRecord,
     GrantRecord,
     corpuser_email_from_urn,
 )
@@ -251,12 +252,17 @@ def send_dbx_approval_notification(
     sql_statements: list[str],
     *,
     principal: str,
+    recipient: str | None,
     catalog: str,
     schema: str | None,
     table: str | None,
 ) -> None:
-    """Notify the requestor that their Databricks access has been provisioned."""
-    to = [principal] if principal else []
+    """Notify the requestor that their Databricks access has been provisioned.
+
+    ``recipient`` is the human to email (the requestor); ``principal`` is the
+    grantee shown in the email, which may be a group for group-based access.
+    """
+    to = [recipient] if recipient else []
     ff = request.form_fields
     note = request.note or ""
     note_row = (
@@ -279,18 +285,55 @@ def send_dbx_approval_notification(
     _send(smtp_config, to, "✅ Your DataHub access request has been approved", html)
 
 
+def send_dbx_ticket_notification(
+    smtp_config: SmtpConfig,
+    request: AccessRequest,
+    *,
+    recipient: str | None,
+    principal: str,
+    catalog: str,
+    schema: str | None,
+    table: str | None,
+    ticket_key: str,
+    ticket_url: str | None,
+) -> None:
+    """Notify the requestor that an access ticket was opened (ticketing 'replace' mode)."""
+    to = [recipient] if recipient else []
+    ff = request.form_fields
+    note = request.note or ""
+    note_row = (
+        "<tr><td style='padding:6px;font-weight:bold;'>Approver Note"
+        f"</td><td style='padding:6px;'>{note}</td></tr>"
+        if note
+        else ""
+    )
+    ticket = f'<a href="{ticket_url}">{ticket_key}</a>' if ticket_url else ticket_key
+    html = _render(
+        "dbx_ticket_approval.html",
+        heading_color="#28a745",
+        heading="Access Request Approved",
+        resource=request.resource or "—",
+        target=_dbx_target_label(catalog, schema, table),
+        granted_to=principal or "—",
+        duration=f"{ff.access_duration_days} days" if ff.access_duration_days else "Indefinite",
+        ticket=ticket,
+        note_row=note_row,
+    )
+    _send(smtp_config, to, "✅ Your DataHub access request has been approved", html)
+
+
 def send_dbx_provisioning_failure_notification(
     smtp_config: SmtpConfig,
     request: AccessRequest,
     error_message: str,
     *,
-    principal: str,
+    recipient: str | None,
     catalog: str,
     schema: str | None,
     table: str | None,
 ) -> None:
-    """Notify the requestor that Databricks provisioning failed permanently."""
-    to = [principal] if principal else []
+    """Notify the requestor (``recipient``) that Databricks provisioning failed."""
+    to = [recipient] if recipient else []
     if not to:
         logger.warning(
             f"[Email] No requestor email for {request.urn} — skipping failure notification"
@@ -319,11 +362,59 @@ def send_dbx_revocation_notification(
         "dbx_revocation.html",
         heading_color="#6c757d",
         heading="Access Revoked — Expiry Reached",
-        target=_dbx_target_label(grant.catalog, grant.schema, grant.table),
+        target=_dbx_target_label(grant.catalog, grant.schema_name, grant.table),
         principal=grant.principal,
         urn=grant.action_request_urn,
     )
     _send(smtp_config, to, "🔒 Your Databricks access has expired and been revoked", html)
+
+
+def send_dbx_membership_notification(
+    smtp_config: SmtpConfig,
+    request: AccessRequest,
+    *,
+    recipient: str | None,
+    member: str,
+    group: str,
+) -> None:
+    """Notify the requestor that they were added to a Databricks group."""
+    to = [recipient] if recipient else []
+    ff = request.form_fields
+    note = request.note or ""
+    note_row = (
+        "<tr><td style='padding:6px;font-weight:bold;'>Approver Note"
+        f"</td><td style='padding:6px;'>{note}</td></tr>"
+        if note
+        else ""
+    )
+    html = _render(
+        "dbx_membership_approval.html",
+        heading_color="#28a745",
+        heading="Access Request Approved",
+        resource=request.resource or "—",
+        group=group,
+        member=member,
+        duration=f"{ff.access_duration_days} days" if ff.access_duration_days else "Indefinite",
+        note_row=note_row,
+    )
+    _send(smtp_config, to, "✅ Your DataHub access request has been approved", html)
+
+
+def send_dbx_membership_removal_notification(
+    smtp_config: SmtpConfig,
+    membership: DatabricksGroupMembershipRecord,
+) -> None:
+    """Notify the requestor that their group membership was removed on expiry."""
+    to = [membership.user_email] if membership.user_email else []
+    html = _render(
+        "dbx_membership_removal.html",
+        heading_color="#6c757d",
+        heading="Access Revoked — Expiry Reached",
+        group=membership.group_name,
+        member=membership.user_email,
+        urn=membership.action_request_urn,
+    )
+    _send(smtp_config, to, "🔒 Your Databricks group access has expired", html)
 
 
 def _sql_block(statements: list[str]) -> str:
