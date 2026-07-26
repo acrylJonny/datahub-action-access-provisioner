@@ -289,15 +289,44 @@ def _execute(
 
 
 def ensure_state_tables(conn, state: StateConfig) -> None:
-    """Create the grants, SLA-notification, and errors tracking tables if they don't already exist."""
+    """Create the grants, SLA-notification, errors, and ledger tables if they don't already exist."""
     with _cursor(conn) as cur:
         cur.execute(ddl.GRANTS_TABLE.format(table=state.qualified_grants_table))
         cur.execute(ddl.SLA_TABLE.format(table=state.qualified_sla_table))
         cur.execute(ddl.ERRORS_TABLE.format(table=state.qualified_errors_table))
+        cur.execute(ddl.LEDGER_TABLE.format(table=state.qualified_ledger_table))
     logger.info(
         f"[State] State tables ready: {state.qualified_grants_table}, "
-        f"{state.qualified_sla_table}, {state.qualified_errors_table}"
+        f"{state.qualified_sla_table}, {state.qualified_errors_table}, "
+        f"{state.qualified_ledger_table}"
     )
+
+
+def is_stage_processed(conn, action_request_urn: str, stage: str, state: StateConfig) -> bool:
+    """Return True if this (request, stage) has already been claimed in the ledger."""
+    sql = dml.COUNT_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(sql, (action_request_urn, stage))
+        row = cur.fetchone()
+        return bool(row and row[0] > 0)
+
+
+def claim_stage(conn, action_request_urn: str, stage: str, state: StateConfig) -> bool:
+    """Atomically claim a processing stage for a request.
+
+    Returns True if this call won the claim (the caller should now perform the
+    stage's side effect exactly once), or False if it was already claimed by a
+    previous run or a duplicate event. The claim is written *before* the side
+    effect so a replayed event never triggers a second notification.
+    """
+    if is_stage_processed(conn, action_request_urn, stage, state):
+        return False
+    sql = dml.CLAIM_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(sql, (action_request_urn, stage, action_request_urn, stage))
+        # rowcount is 1 when this INSERT won the claim, 0 if another writer beat us.
+        claimed = getattr(cur, "rowcount", 1) != 0
+    return claimed
 
 
 def is_already_provisioned(conn, action_request_urn: str, state: StateConfig) -> bool:

@@ -11,6 +11,14 @@ REQUEST_RESULT_DENIED = "REJECTED"
 # The actionRequestInfo.type value for workflow-form-based requests
 ACTION_REQUEST_TYPE_WORKFLOW = "WORKFLOW_FORM_REQUEST"
 
+# Processing-ledger stages — each is claimed exactly once per request URN so that
+# a replayed or duplicate event never repeats the associated one-shot side effect.
+LEDGER_STAGE_APPROVAL_NOTIFIED = "approval_notified"
+LEDGER_STAGE_DENIAL_NOTIFIED = "denial_notified"
+LEDGER_STAGE_REVOCATION_NOTIFIED = "revocation_notified"
+LEDGER_STAGE_MEMBERSHIP_NOTIFIED = "membership_notified"
+LEDGER_STAGE_MEMBERSHIP_REMOVAL_NOTIFIED = "membership_removal_notified"
+
 _CORPUSER_PREFIX = "urn:li:corpuser:"
 
 

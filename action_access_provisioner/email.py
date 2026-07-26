@@ -20,13 +20,22 @@ _DEFAULT_FOOTER = "This is an automated notification from DataHub Access Provisi
 
 
 def _send(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     to_addresses: list[str],
     subject: str,
     html_body: str,
     cc_addresses: list[str] | None = None,
 ) -> None:
-    """Send an HTML email via SMTP."""
+    """Send an HTML email via SMTP.
+
+    Email notifications are optional: when ``smtp_config`` is ``None`` (no SMTP block
+    configured) every notification becomes a no-op, so the action still provisions,
+    revokes, and tracks state — it just stays silent. This is the single choke point
+    all ``send_*`` helpers funnel through, so the guard here covers them all.
+    """
+    if smtp_config is None:
+        logger.debug(f"Email notifications disabled (no SMTP configured) — skipping '{subject}'")
+        return
     if not to_addresses:
         logger.warning(f"No recipients provided for email subject='{subject}' — skipping")
         return
@@ -93,7 +102,7 @@ def _render(
 
 
 def send_approval_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     sql_statements: list[str],
 ) -> None:
@@ -126,7 +135,7 @@ def send_approval_notification(
 
 
 def send_denial_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
 ) -> None:
     """Notify the requestor that their access request has been denied."""
@@ -145,7 +154,7 @@ def send_denial_notification(
 
 
 def send_sla_warning(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     action_request_urn: str,
     resource: str | None,
     pending_hours: float,
@@ -168,7 +177,7 @@ def send_sla_warning(
 
 
 def send_escalation_alert(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     action_request_urn: str,
     resource: str | None,
     pending_hours: float,
@@ -195,7 +204,7 @@ def send_escalation_alert(
 
 
 def send_provisioning_failure_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     error_message: str,
 ) -> None:
@@ -221,7 +230,7 @@ def send_provisioning_failure_notification(
 
 
 def send_revocation_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     grant: GrantRecord,
 ) -> None:
     """Notify the original requestor that their access has been auto-revoked on expiry."""
@@ -247,7 +256,7 @@ def _dbx_target_label(catalog: str | None, schema: str | None, table: str | None
 
 
 def send_dbx_approval_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     sql_statements: list[str],
     *,
@@ -286,7 +295,7 @@ def send_dbx_approval_notification(
 
 
 def send_dbx_ticket_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     *,
     recipient: str | None,
@@ -323,7 +332,7 @@ def send_dbx_ticket_notification(
 
 
 def send_dbx_provisioning_failure_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     error_message: str,
     *,
@@ -353,7 +362,7 @@ def send_dbx_provisioning_failure_notification(
 
 
 def send_dbx_revocation_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     grant: DatabricksGrantRecord,
 ) -> None:
     """Notify the original requestor that their Databricks access was auto-revoked."""
@@ -370,7 +379,7 @@ def send_dbx_revocation_notification(
 
 
 def send_dbx_membership_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     request: AccessRequest,
     *,
     recipient: str | None,
@@ -401,7 +410,7 @@ def send_dbx_membership_notification(
 
 
 def send_dbx_membership_removal_notification(
-    smtp_config: SmtpConfig,
+    smtp_config: SmtpConfig | None,
     membership: DatabricksGroupMembershipRecord,
 ) -> None:
     """Notify the requestor that their group membership was removed on expiry."""

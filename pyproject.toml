@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "datahub-action-access-provisioner"
-version = "0.1.19"
+version = "0.1.20"
 description = "DataHub Action to provision Snowflake or Databricks access and send email notifications on workflow approval"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -30,11 +30,17 @@ databricks = [
     "databricks-sql-connector>=3.0.0",
     "databricks-sdk>=0.20.0",
 ]
+# Snowflake OAUTH_AUTHENTICATOR with a Microsoft IdP needs MSAL. The Okta OAuth flow
+# uses requests, which snowflake-connector-python already pulls in.
+snowflake-oauth = [
+    "msal>=1.20.0",
+]
 dev = [
     "acryl-datahub-actions>=1.0.0",
     "acryl-datahub>=1.0.0",
     "databricks-sql-connector>=3.0.0",
     "databricks-sdk>=0.20.0",
+    "msal>=1.20.0",
     "ruff>=0.1.0",
     "mypy>=1.0.0",
     "pytest>=7.0.0",

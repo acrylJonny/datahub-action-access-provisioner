@@ -22,8 +22,9 @@ logger = logging.getLogger(__name__)
 # the values, which originate from user-submitted form fields, can be safely
 # inlined into GRANT statements (identifiers cannot be passed as bind params).
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
-# Principals are emails / usernames / group names.
-_PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9_.@+\-]+$")
+# Control characters are never valid in a principal and would let a value break out
+# of the backtick quoting, so they are rejected outright.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f]")
 
 
 def _ident(name: str) -> str:
@@ -64,10 +65,16 @@ def parse_databricks_dataset_urn(urn: str | None) -> tuple[str, str, str] | None
 
 
 def _principal(name: str) -> str:
-    """Validate and backtick-quote a Databricks principal (user/group/SP)."""
-    if not name or not _PRINCIPAL_RE.match(name):
+    """Backtick-quote a Databricks principal (user email / group name / service principal).
+
+    Group display names legitimately contain spaces and other punctuation, so rather
+    than restrict the character set we escape any embedded backticks (Spark SQL doubles
+    them) and reject only control characters. The value always comes from a trusted
+    DataHub identity or a configured group name, not free-form request text.
+    """
+    if not name or _CONTROL_CHARS_RE.search(name):
         raise ValueError(f"Invalid Databricks principal: {name!r}")
-    return f"`{name}`"
+    return "`" + name.replace("`", "``") + "`"
 
 
 @contextmanager
@@ -322,17 +329,48 @@ def remove_group_member(
 
 
 def ensure_state_tables(conn, state: DatabricksStateConfig) -> None:
-    """Create the grants, SLA, errors, and memberships Delta tables if absent."""
+    """Create the grants, SLA, errors, memberships, and ledger Delta tables if absent."""
     with _cursor(conn) as cur:
         cur.execute(ddl.GRANTS_TABLE.format(table=state.qualified_grants_table))
         cur.execute(ddl.SLA_TABLE.format(table=state.qualified_sla_table))
         cur.execute(ddl.ERRORS_TABLE.format(table=state.qualified_errors_table))
         cur.execute(ddl.MEMBERSHIPS_TABLE.format(table=state.qualified_memberships_table))
+        cur.execute(ddl.LEDGER_TABLE.format(table=state.qualified_ledger_table))
     logger.info(
         f"[State] Delta state tables ready: {state.qualified_grants_table}, "
         f"{state.qualified_sla_table}, {state.qualified_errors_table}, "
-        f"{state.qualified_memberships_table}"
+        f"{state.qualified_memberships_table}, {state.qualified_ledger_table}"
     )
+
+
+def is_stage_processed(
+    conn, action_request_urn: str, stage: str, state: DatabricksStateConfig
+) -> bool:
+    """Return True if this (request, stage) has already been claimed in the ledger."""
+    sql = dml.COUNT_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(sql, {"urn": action_request_urn, "stage": stage})
+        row = cur.fetchone()
+        return bool(row and int(row[0]) > 0)
+
+
+def claim_stage(conn, action_request_urn: str, stage: str, state: DatabricksStateConfig) -> bool:
+    """Atomically claim a processing stage for a request.
+
+    Returns True if this call won the claim (the caller should now perform the
+    stage's side effect exactly once), or False if it was already claimed. The
+    claim is written *before* the side effect so a replayed event never triggers
+    a second notification.
+    """
+    if is_stage_processed(conn, action_request_urn, stage, state):
+        return False
+    sql = dml.CLAIM_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(
+            sql,
+            {"urn": action_request_urn, "stage": stage, "now": int(time.time() * 1000)},
+        )
+    return True
 
 
 def is_already_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:

@@ -1,19 +1,94 @@
 from enum import Enum
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
+
+# Snowflake application tag (shows up in QUERY_HISTORY, mirrors the ingestion connector).
+_SNOWFLAKE_APPLICATION_NAME = "acryl_datahub_access_provisioner"
+
+# The authentication types the Snowflake connector accepts, matching the DataHub
+# Snowflake ingestion connector (metadata-ingestion/.../snowflake_connection.py).
+_SNOWFLAKE_VALID_AUTH_TYPES = {
+    "DEFAULT_AUTHENTICATOR",
+    "EXTERNAL_BROWSER_AUTHENTICATOR",
+    "KEY_PAIR_AUTHENTICATOR",
+    "OAUTH_AUTHENTICATOR",
+    "OAUTH_AUTHENTICATOR_TOKEN",
+}
+
+
+class OAuthIdentityProvider(str, Enum):
+    """OAuth identity providers supported for ``OAUTH_AUTHENTICATOR`` (mirrors ingestion)."""
+
+    MICROSOFT = "microsoft"
+    OKTA = "okta"
+
+
+class OAuthConfiguration(BaseModel):
+    """OAuth settings for Snowflake ``OAUTH_AUTHENTICATOR``.
+
+    Mirrors the ingestion connector's ``OAuthConfiguration`` so the same recipe
+    values work here. DataHub fetches a token from the IdP (Microsoft/Okta) and
+    connects to Snowflake with ``authenticator=oauth``.
+    """
+
+    provider: OAuthIdentityProvider = Field(
+        description="OAuth identity provider — 'microsoft' or 'okta'"
+    )
+    authority_url: str = Field(description="OAuth token endpoint / authority URL")
+    client_id: str = Field(description="OAuth client (application) ID")
+    scopes: list[str] = Field(description="OAuth scopes to request")
+    use_certificate: bool = Field(
+        default=False,
+        description="Use a client certificate instead of a secret (Microsoft only)",
+    )
+    client_secret: str | None = Field(
+        default=None,
+        description="OAuth client secret (required unless use_certificate=True)",
+    )
+    encoded_oauth_public_key: str | None = Field(
+        default=None,
+        description="Base64-encoded public certificate (required when use_certificate=True)",
+    )
+    encoded_oauth_private_key: str | None = Field(
+        default=None,
+        description="Base64-encoded private key (required when use_certificate=True)",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "OAuthConfiguration":
+        if self.use_certificate:
+            if self.provider != OAuthIdentityProvider.MICROSOFT:
+                raise ValueError("Certificate authentication is only supported for Microsoft")
+            if not self.encoded_oauth_public_key or not self.encoded_oauth_private_key:
+                raise ValueError(
+                    "encoded_oauth_public_key and encoded_oauth_private_key are required "
+                    "when use_certificate=True"
+                )
+        elif not self.client_secret:
+            raise ValueError("client_secret is required when use_certificate=False")
+        return self
 
 
 class SnowflakeConnectionConfig(BaseModel):
     """Snowflake connection parameters.
 
-    Uses snowflake-connector-python directly — no SQLAlchemy required.
+    Uses snowflake-connector-python directly — no SQLAlchemy required. Supports the
+    same authentication mechanisms as the DataHub Snowflake ingestion connector:
+    ``DEFAULT_AUTHENTICATOR`` (user/password), ``KEY_PAIR_AUTHENTICATOR``,
+    ``OAUTH_AUTHENTICATOR`` (Microsoft/Okta), ``OAUTH_AUTHENTICATOR_TOKEN`` (a
+    pre-supplied token) and ``EXTERNAL_BROWSER_AUTHENTICATOR`` (interactive; local/dev
+    only — it cannot complete on the headless remote executor).
     """
 
     account_id: str = Field(description="Snowflake account identifier (e.g. xy12345.us-east-1)")
-    username: str = Field(description="Snowflake username")
+    username: str | None = Field(
+        default=None,
+        description="Snowflake username (required for every auth type except a raw OAuth token)",
+    )
     password: str | None = Field(
-        default=None, description="Snowflake password (username/password auth)"
+        default=None,
+        description="Snowflake password (DEFAULT/external-browser/Okta password grant)",
     )
     warehouse: str | None = Field(default=None, description="Default warehouse to use")
     role: str | None = Field(
@@ -22,48 +97,132 @@ class SnowflakeConnectionConfig(BaseModel):
     )
     authentication_type: str = Field(
         default="DEFAULT_AUTHENTICATOR",
-        description="Snowflake authentication type (DEFAULT_AUTHENTICATOR or KEY_PAIR_AUTHENTICATOR)",
+        description=(
+            "Authenticator to use: DEFAULT_AUTHENTICATOR, KEY_PAIR_AUTHENTICATOR, "
+            "OAUTH_AUTHENTICATOR, OAUTH_AUTHENTICATOR_TOKEN or EXTERNAL_BROWSER_AUTHENTICATOR."
+        ),
     )
     private_key: str | None = Field(
         default=None,
-        description="PEM-encoded RSA private key for key-pair authentication",
+        description="PEM-encoded RSA private key for key-pair authentication (inline)",
+    )
+    private_key_path: str | None = Field(
+        default=None,
+        description="Path to a PEM private key file (alternative to private_key)",
     )
     private_key_password: str | None = Field(
         default=None,
         description="Passphrase for the encrypted private key (if applicable)",
     )
+    oauth_config: OAuthConfiguration | None = Field(
+        default=None,
+        description="OAuth settings, required when authentication_type=OAUTH_AUTHENTICATOR",
+    )
+    token: str | None = Field(
+        default=None,
+        description="Pre-supplied OAuth token, used only with OAUTH_AUTHENTICATOR_TOKEN",
+    )
+    snowflake_domain: str = Field(
+        default="snowflakecomputing.com",
+        description="Snowflake domain suffix (use 'snowflakecomputing.cn' for China regions)",
+    )
+    connect_args: dict[str, Any] | None = Field(
+        default=None,
+        description="Extra keyword arguments passed verbatim to snowflake.connector.connect",
+    )
+
+    @model_validator(mode="after")
+    def _validate_auth(self) -> "SnowflakeConnectionConfig":
+        auth = self.authentication_type
+        if auth not in _SNOWFLAKE_VALID_AUTH_TYPES:
+            raise ValueError(
+                f"Unsupported authentication_type {auth!r}. "
+                f"Supported: {sorted(_SNOWFLAKE_VALID_AUTH_TYPES)}"
+            )
+        has_key = bool(self.private_key or self.private_key_path)
+        if has_key and auth != "KEY_PAIR_AUTHENTICATOR":
+            raise ValueError(
+                "private_key / private_key_path are only valid with KEY_PAIR_AUTHENTICATOR"
+            )
+        if auth == "KEY_PAIR_AUTHENTICATOR" and not has_key:
+            raise ValueError(
+                "KEY_PAIR_AUTHENTICATOR requires private_key or private_key_path to be set"
+            )
+        if auth == "OAUTH_AUTHENTICATOR" and self.oauth_config is None:
+            raise ValueError("OAUTH_AUTHENTICATOR requires oauth_config to be set")
+        if self.token and auth != "OAUTH_AUTHENTICATOR_TOKEN":
+            raise ValueError("token is only valid with OAUTH_AUTHENTICATOR_TOKEN")
+        if auth == "OAUTH_AUTHENTICATOR_TOKEN" and not self.token:
+            raise ValueError("OAUTH_AUTHENTICATOR_TOKEN requires token to be set")
+        return self
+
+    def _load_private_key_der(self) -> bytes:
+        """Load the PEM private key (inline or from file) and return DER/PKCS8 bytes."""
+        from cryptography.hazmat.backends import default_backend
+        from cryptography.hazmat.primitives import serialization
+
+        if self.private_key:
+            pem = self.private_key
+            # DataHub ${ENV} injection often flattens PEM newlines to literal "\n";
+            # restore them so the key parses. ponytail: only when no real newline present.
+            if "\\n" in pem and "\n" not in pem:
+                pem = pem.replace("\\n", "\n")
+            pem_bytes = pem.encode()
+        elif self.private_key_path:
+            with open(self.private_key_path, "rb") as fh:
+                pem_bytes = fh.read()
+        else:
+            raise ValueError("No private key configured for KEY_PAIR_AUTHENTICATOR")
+
+        passphrase = self.private_key_password.encode() if self.private_key_password else None
+        p_key = serialization.load_pem_private_key(
+            pem_bytes, password=passphrase, backend=default_backend()
+        )
+        return p_key.private_bytes(
+            encoding=serialization.Encoding.DER,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
 
     def get_native_connection(self):
-        """Return a live snowflake.connector connection."""
+        """Return a live snowflake.connector connection for the configured auth type."""
         import snowflake.connector  # lazy import — not needed at config-parse time
 
-        kwargs: dict = {
-            "account": self.account_id,
+        base: dict[str, Any] = {
             "user": self.username,
+            "account": self.account_id,
+            "host": f"{self.account_id}.{self.snowflake_domain}",
+            "application": _SNOWFLAKE_APPLICATION_NAME,
         }
         if self.role:
-            kwargs["role"] = self.role
+            base["role"] = self.role
         if self.warehouse:
-            kwargs["warehouse"] = self.warehouse
+            base["warehouse"] = self.warehouse
+        extra = dict(self.connect_args or {})
+        auth = self.authentication_type
 
-        if self.authentication_type == "KEY_PAIR_AUTHENTICATOR":
-            from cryptography.hazmat.backends import default_backend
-            from cryptography.hazmat.primitives import serialization
-
-            passphrase = self.private_key_password.encode() if self.private_key_password else None
-            pem = (self.private_key or "").encode()
-            p_key = serialization.load_pem_private_key(
-                pem, password=passphrase, backend=default_backend()
+        if auth == "DEFAULT_AUTHENTICATOR":
+            return snowflake.connector.connect(password=self.password, **base, **extra)
+        if auth == "EXTERNAL_BROWSER_AUTHENTICATOR":
+            return snowflake.connector.connect(
+                authenticator="externalbrowser", password=self.password, **base, **extra
             )
-            kwargs["private_key"] = p_key.private_bytes(
-                encoding=serialization.Encoding.DER,
-                format=serialization.PrivateFormat.PKCS8,
-                encryption_algorithm=serialization.NoEncryption(),
+        if auth == "KEY_PAIR_AUTHENTICATOR":
+            return snowflake.connector.connect(
+                private_key=self._load_private_key_der(), **base, **extra
             )
-        elif self.password:
-            kwargs["password"] = self.password
+        if auth == "OAUTH_AUTHENTICATOR_TOKEN":
+            return snowflake.connector.connect(
+                authenticator="oauth", token=self.token, **base, **extra
+            )
+        # OAUTH_AUTHENTICATOR — fetch a token from the IdP, then connect with it.
+        from action_access_provisioner.snowflake_oauth import generate_oauth_token
 
-        return snowflake.connector.connect(**kwargs)
+        assert self.oauth_config is not None  # guaranteed by _validate_auth
+        token = generate_oauth_token(
+            self.oauth_config, username=self.username, password=self.password
+        )
+        return snowflake.connector.connect(authenticator="oauth", token=token, **base, **extra)
 
 
 class SmtpConfig(BaseModel):
@@ -144,6 +303,14 @@ class StateConfig(BaseModel):
             "Requests recorded here are skipped on future catchup passes to prevent infinite retries."
         ),
     )
+    ledger_table: str = Field(
+        default="ACCESS_PROVISIONER_LEDGER",
+        description=(
+            "Processing ledger keyed by (request URN, stage). Guarantees exactly-once "
+            "side effects — a stage is claimed before its notification is sent so duplicate "
+            "or replayed events never send a second approval/denial/revocation email."
+        ),
+    )
 
     @property
     def qualified_grants_table(self) -> str:
@@ -156,6 +323,10 @@ class StateConfig(BaseModel):
     @property
     def qualified_errors_table(self) -> str:
         return f"{self.database}.{self.schema_name}.{self.errors_table}"
+
+    @property
+    def qualified_ledger_table(self) -> str:
+        return f"{self.database}.{self.schema_name}.{self.ledger_table}"
 
 
 class SlaConfig(BaseModel):
@@ -185,6 +356,39 @@ class ExpiryConfig(BaseModel):
     revocation_notification: bool = Field(
         default=True,
         description="Send an email to the original requestor when their access is auto-revoked",
+    )
+
+
+class ReconcileConfig(BaseModel):
+    """Background reconciliation loop settings.
+
+    The action processes live ``actionRequestStatus`` events as they arrive, but
+    event delivery is best-effort: an approval that lands while the process is
+    down, mid-restart, or during a consumer rebalance can be missed. The startup
+    catchup pass only runs once per process, so a long-lived daemon would not
+    re-scan until it restarts — which is how approvals end up delayed by days.
+
+    This loop re-runs the full catchup/reconcile pass on a fixed interval so the
+    worst-case delay for a missed event is bounded by ``interval_seconds`` rather
+    than by the next process restart. Every pass is idempotent (state tables +
+    the processing ledger), so re-scanning never re-grants or re-notifies.
+    """
+
+    enabled: bool = Field(
+        default=True,
+        description=(
+            "Run a background reconciliation loop that periodically re-scans for approved, "
+            "expired, and pending requests. Strongly recommended for long-lived daemon "
+            "deployments so missed live events are still processed promptly."
+        ),
+    )
+    interval_seconds: int = Field(
+        default=300,
+        ge=30,
+        description=(
+            "How often the background reconciliation loop runs, in seconds (minimum 30). "
+            "Bounds the worst-case delay for a missed live event."
+        ),
     )
 
 
@@ -226,7 +430,13 @@ class AccessProvisionerConfig(BaseModel):
             "notifications across scheduled runs. Defaults to DATAHUB.ACCESS_PROVISIONER."
         ),
     )
-    smtp: SmtpConfig = Field(description="SMTP configuration for email notifications")
+    smtp: SmtpConfig | None = Field(
+        default=None,
+        description=(
+            "SMTP configuration for email notifications. Optional — omit to disable all "
+            "email notifications (approvals, denials, SLA reminders, revocations)."
+        ),
+    )
     sla: SlaConfig = Field(
         default_factory=SlaConfig,
         description="SLA monitoring and reminder settings",
@@ -241,6 +451,10 @@ class AccessProvisionerConfig(BaseModel):
             "How many days back to scan DataHub for approved requests on each startup catchup pass. "
             "Requests outside this window are assumed to have been handled by a previous run."
         ),
+    )
+    reconcile: ReconcileConfig = Field(
+        default_factory=ReconcileConfig,
+        description="Background reconciliation loop settings (bounds delay for missed live events)",
     )
     provisioning: SnowflakeProvisioningConfig = Field(
         default_factory=SnowflakeProvisioningConfig,
@@ -279,27 +493,46 @@ class AccessProvisionerConfig(BaseModel):
 # ===========================================================================
 
 
+class AzureAuthConfig(BaseModel):
+    """Azure AD service-principal auth for Azure Databricks (mirrors the ingestion connector)."""
+
+    client_id: str = Field(description="Azure AD application (client) ID")
+    tenant_id: str = Field(description="Azure AD tenant ID")
+    client_secret: str = Field(description="Azure AD client secret")
+
+
 class DatabricksConnectionConfig(BaseModel):
     """Databricks workspace connection parameters.
 
-    Supports two auth methods:
-      - Personal access token (PAT): set ``token``.
-      - OAuth machine-to-machine (service principal): set ``client_id`` +
-        ``client_secret``.
+    Supports the same authentication mechanisms as the DataHub Unity Catalog
+    ingestion connector, mutually exclusive:
 
-    A SQL warehouse (``http_path``) is always required: state/log tables are
-    Delta tables, and (when ``grant_method: sql``) GRANT/REVOKE statements run
-    through the warehouse too.
+      - **PAT** — set ``token``.
+      - **OAuth M2M (service principal)** — set ``client_id`` + ``client_secret``.
+      - **Azure AD service principal** — set ``azure_auth`` (Azure Databricks).
+      - **Unified auth** — set none of the above; the Databricks SDK resolves
+        credentials from its default chain (env vars / config profile).
+
+    A SQL warehouse (``http_path`` or ``warehouse_id``) is always required: the
+    Delta state/log tables live there, and (with ``grant_method: sql``) GRANT/REVOKE
+    run through it too. All auth flows through the SDK ``WorkspaceClient`` credential
+    chain, so both the SQL warehouse and the Unity Catalog grants API share one
+    resolved credential.
     """
 
     host: str = Field(
         description="Workspace URL, e.g. https://dbc-xxxx.cloud.databricks.com",
     )
-    http_path: str = Field(
+    http_path: str | None = Field(
+        default=None,
         description=(
-            "SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123). Required for the "
-            "Delta state/log tables and for SQL-based GRANT/REVOKE."
+            "SQL warehouse HTTP path (e.g. /sql/1.0/warehouses/abc123). Required unless "
+            "warehouse_id is set. Used for the Delta state/log tables and SQL-based GRANT/REVOKE."
         ),
+    )
+    warehouse_id: str | None = Field(
+        default=None,
+        description="SQL warehouse ID (http_path is derived from it when http_path is unset)",
     )
     token: str | None = Field(
         default=None,
@@ -307,22 +540,35 @@ class DatabricksConnectionConfig(BaseModel):
     )
     client_id: str | None = Field(
         default=None,
-        description="OAuth service-principal client ID (M2M auth)",
+        description="OAuth service-principal client ID (Databricks M2M auth)",
     )
     client_secret: str | None = Field(
         default=None,
-        description="OAuth service-principal client secret (M2M auth)",
+        description="OAuth service-principal client secret (Databricks M2M auth)",
+    )
+    azure_auth: AzureAuthConfig | None = Field(
+        default=None,
+        description="Azure AD service-principal auth (for Azure Databricks workspaces)",
     )
 
     @model_validator(mode="after")
-    def _require_auth(self) -> "DatabricksConnectionConfig":
-        has_pat = bool(self.token)
-        has_oauth = bool(self.client_id and self.client_secret)
-        if not (has_pat or has_oauth):
+    def _validate_auth(self) -> "DatabricksConnectionConfig":
+        methods = sum(
+            [
+                bool(self.token),
+                bool(self.azure_auth),
+                bool(self.client_id or self.client_secret),
+            ]
+        )
+        if methods > 1:
             raise ValueError(
-                "Databricks connection requires either 'token' (PAT) or "
-                "'client_id' + 'client_secret' (OAuth service principal)."
+                "Provide only one Databricks auth method: 'token' (PAT), 'azure_auth', "
+                "or 'client_id'/'client_secret' (OAuth M2M). Leave all unset for unified auth."
             )
+        if bool(self.client_id) != bool(self.client_secret):
+            raise ValueError("Databricks OAuth M2M requires both 'client_id' and 'client_secret'.")
+        if not self.http_path and not self.warehouse_id:
+            raise ValueError("Databricks connection requires either 'http_path' or 'warehouse_id'.")
         return self
 
     @property
@@ -330,8 +576,47 @@ class DatabricksConnectionConfig(BaseModel):
         """Bare hostname (no scheme / trailing slash) for the SQL connector."""
         return self.host.replace("https://", "").replace("http://", "").rstrip("/")
 
+    @property
+    def resolved_http_path(self) -> str:
+        """The SQL-warehouse HTTP path, derived from warehouse_id when not given explicitly."""
+        if self.http_path:
+            return self.http_path
+        return f"/sql/1.0/warehouses/{self.warehouse_id}"
+
+    def get_workspace_client(self):
+        """Return a databricks-sdk WorkspaceClient for the configured auth method.
+
+        The SDK's credential chain covers PAT, Databricks OAuth M2M, Azure AD service
+        principal, and unified auth (env/profile) — so passing whichever fields are set
+        (or none) selects the right mechanism automatically.
+        """
+        from databricks.sdk import WorkspaceClient
+
+        kwargs: dict[str, Any] = {"host": f"https://{self.server_hostname}"}
+        if self.token:
+            kwargs["token"] = self.token
+        if self.client_id:
+            kwargs["client_id"] = self.client_id
+        if self.client_secret:
+            kwargs["client_secret"] = self.client_secret
+        if self.azure_auth:
+            kwargs["azure_tenant_id"] = self.azure_auth.tenant_id
+            kwargs["azure_client_id"] = self.azure_auth.client_id
+            kwargs["azure_client_secret"] = self.azure_auth.client_secret
+
+        client = WorkspaceClient(**kwargs)
+        if self.warehouse_id:
+            client.config.warehouse_id = self.warehouse_id
+        return client
+
     def get_sql_connection(self):
-        """Return a live databricks-sql-connector connection."""
+        """Return a live databricks-sql-connector connection.
+
+        Auth is delegated to the WorkspaceClient credential chain (the same object used
+        for the grants API and SCIM), so every supported auth method — PAT, OAuth M2M,
+        Azure AD, unified — works for the SQL warehouse too. Mirrors the ingestion
+        connector's ``get_sql_connection_params``.
+        """
         from databricks import sql  # lazy import — only needed at runtime
 
         # The DataHub Cloud executor pins databricks-sql-connector==2.9.6, which
@@ -341,41 +626,11 @@ class DatabricksConnectionConfig(BaseModel):
         # connectors (3.x/4.x default to the "named" paramstyle).
         sql.paramstyle = "pyformat"
 
-        if self.token:
-            return sql.connect(
-                server_hostname=self.server_hostname,
-                http_path=self.http_path,
-                access_token=self.token,
-            )
-
-        # OAuth M2M (service principal) — mint a credentials provider via the SDK.
-        from databricks.sdk.core import Config, oauth_service_principal
-
-        def _credentials_provider():
-            return oauth_service_principal(
-                Config(
-                    host=f"https://{self.server_hostname}",
-                    client_id=self.client_id,
-                    client_secret=self.client_secret,
-                )
-            )
-
+        workspace_client = self.get_workspace_client()
         return sql.connect(
             server_hostname=self.server_hostname,
-            http_path=self.http_path,
-            credentials_provider=_credentials_provider,
-        )
-
-    def get_workspace_client(self):
-        """Return a databricks-sdk WorkspaceClient (used when grant_method='sdk')."""
-        from databricks.sdk import WorkspaceClient
-
-        if self.token:
-            return WorkspaceClient(host=f"https://{self.server_hostname}", token=self.token)
-        return WorkspaceClient(
-            host=f"https://{self.server_hostname}",
-            client_id=self.client_id,
-            client_secret=self.client_secret,
+            http_path=self.resolved_http_path,
+            credentials_provider=lambda: workspace_client.config.authenticate,
         )
 
 
@@ -412,6 +667,14 @@ class DatabricksStateConfig(BaseModel):
         default="access_provisioner_group_memberships",
         description="Delta table tracking group-membership grants (membership access model)",
     )
+    ledger_table: str = Field(
+        default="access_provisioner_ledger",
+        description=(
+            "Processing ledger keyed by (request URN, stage). Guarantees exactly-once "
+            "side effects — a stage is claimed before its notification is sent so duplicate "
+            "or replayed events never send a second approval/denial/revocation email."
+        ),
+    )
 
     @property
     def qualified_grants_table(self) -> str:
@@ -428,6 +691,10 @@ class DatabricksStateConfig(BaseModel):
     @property
     def qualified_memberships_table(self) -> str:
         return f"`{self.catalog}`.`{self.schema_name}`.`{self.memberships_table}`"
+
+    @property
+    def qualified_ledger_table(self) -> str:
+        return f"`{self.catalog}`.`{self.schema_name}`.`{self.ledger_table}`"
 
 
 class TicketProvider(str, Enum):
@@ -532,6 +799,31 @@ class DatabricksProvisioningConfig(BaseModel):
     )
 
 
+class DatabricksIdentityConfig(BaseModel):
+    """How a DataHub requestor is mapped to a Databricks principal (user email).
+
+    By default the requestor's corpuser URN id is used when it is itself an email
+    (``urn:li:corpuser:jane@corp.com`` -> ``jane@corp.com``). When DataHub usernames
+    are not emails (common with SSO), the requestor's email is looked up from their
+    DataHub corpuser profile, and an explicit override map takes precedence over both.
+    """
+
+    principal_overrides: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Explicit map from a DataHub corpuser (full URN or bare id) to a Databricks "
+            "principal (email). Checked first, before any automatic resolution."
+        ),
+    )
+    resolve_email_from_datahub: bool = Field(
+        default=True,
+        description=(
+            "When the corpuser URN id is not itself an email, look up the user's email "
+            "from their DataHub corpuser profile (corpUserInfo / editableInfo)."
+        ),
+    )
+
+
 class DatahubSyncConfig(BaseModel):
     """Mirror granted Databricks access into DataHub for auditing.
 
@@ -579,7 +871,13 @@ class DatabricksAccessProvisionerConfig(BaseModel):
         default_factory=DatabricksStateConfig,
         description="Unity Catalog location for the Delta state/log tables",
     )
-    smtp: SmtpConfig = Field(description="SMTP configuration for email notifications")
+    smtp: SmtpConfig | None = Field(
+        default=None,
+        description=(
+            "SMTP configuration for email notifications. Optional — omit to disable all "
+            "email notifications (approvals, denials, SLA reminders, revocations)."
+        ),
+    )
     sla: SlaConfig = Field(
         default_factory=SlaConfig,
         description="SLA monitoring and reminder settings",
@@ -592,9 +890,17 @@ class DatabricksAccessProvisionerConfig(BaseModel):
         default=90,
         description="How many days back to scan DataHub for approved requests on each startup pass",
     )
+    reconcile: ReconcileConfig = Field(
+        default_factory=ReconcileConfig,
+        description="Background reconciliation loop settings (bounds delay for missed live events)",
+    )
     provisioning: DatabricksProvisioningConfig = Field(
         default_factory=DatabricksProvisioningConfig,
         description="Options controlling how Databricks grants are executed",
+    )
+    identity: DatabricksIdentityConfig = Field(
+        default_factory=DatabricksIdentityConfig,
+        description="How DataHub requestors are mapped to Databricks principals",
     )
     ticketing: TicketingConfig | None = Field(
         default=None,

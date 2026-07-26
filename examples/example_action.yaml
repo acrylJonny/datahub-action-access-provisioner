@@ -15,18 +15,25 @@
 #
 # SCHEDULING NOTE
 # ---------------
-# The DataHub Cloud executor kills actions after ~5 minutes of idle time.
-# This action is therefore designed to be run on a schedule (e.g. every 30 minutes)
-# rather than as a persistent daemon.
+# The action supports two deployment models, both durable and exactly-once:
+#   - Long-lived daemon (recommended): the background reconciliation loop
+#     (`reconcile.enabled: true`, below) re-runs the catchup pass on an interval,
+#     so a live event missed while the process was down or rebalancing is picked
+#     up within `interval_seconds` instead of waiting for a restart.
+#   - Scheduled invocation: if the executor kills idle actions, run on a schedule
+#     (e.g. every 30 minutes); the startup catchup gives the same guarantee.
 #
-# On each invocation the action:
-#   1. Runs a startup catchup pass:
+# On each invocation / reconcile pass the action:
+#   1. Runs a catchup pass:
 #        - Fetches all COMPLETED/APPROVED requests from the last N days
 #        - Skips any already recorded in the Snowflake state table (idempotent)
+#        - Skips any recorded as a permanent failure (errors table)
 #        - Provisions Snowflake access + emails for any new approvals
 #        - Revokes any grants whose access_duration has expired
 #        - Sends SLA reminders for pending requests (deduped via state table)
-#   2. Listens for live events for the remaining ~5-minute window
+#      All one-shot emails are gated by the exactly-once ledger, so duplicate or
+#      replayed events never send a second notification.
+#   2. Listens for live events for the remaining idle window
 #
 # =============================================================================
 # DATAHUB CLOUD DEPLOYMENT (recommended)
@@ -55,6 +62,39 @@ source:
           warehouse: "COMPUTE_WH"
           role: "SYSADMIN"                   # Must have GRANT OPTION privilege
           authentication_type: "DEFAULT_AUTHENTICATOR"
+          # snowflake_domain: "snowflakecomputing.com"   # use ...cn for China regions
+          # connect_args: {}                             # extra snowflake.connector.connect kwargs
+          #
+          # The same authentication mechanisms as the DataHub Snowflake ingestion
+          # connector are supported. Pick ONE authentication_type:
+          #
+          # 1) DEFAULT_AUTHENTICATOR  — username + password (above).
+          #
+          # 2) KEY_PAIR_AUTHENTICATOR — RSA key pair (recommended for automation):
+          #      authentication_type: "KEY_PAIR_AUTHENTICATOR"
+          #      private_key: "${SNOWFLAKE_PRIVATE_KEY}"      # inline PEM, or:
+          #      private_key_path: "/secrets/snowflake_key.p8"
+          #      private_key_password: "${SNOWFLAKE_KEY_PASSPHRASE}"  # if encrypted
+          #
+          # 3) OAUTH_AUTHENTICATOR    — token fetched from Microsoft/Okta:
+          #      authentication_type: "OAUTH_AUTHENTICATOR"
+          #      oauth_config:
+          #        provider: "microsoft"          # or "okta"
+          #        authority_url: "https://login.microsoftonline.com/<tenant>/oauth2/v2.0/token"
+          #        client_id: "${OAUTH_CLIENT_ID}"
+          #        scopes: ["session:role:SYSADMIN"]
+          #        client_secret: "${OAUTH_CLIENT_SECRET}"        # secret-based, OR:
+          #        # use_certificate: true                         # Microsoft only
+          #        # encoded_oauth_public_key: "${OAUTH_PUB_B64}"
+          #        # encoded_oauth_private_key: "${OAUTH_PRIV_B64}"
+          #
+          # 4) OAUTH_AUTHENTICATOR_TOKEN — supply a pre-minted OAuth token:
+          #      authentication_type: "OAUTH_AUTHENTICATOR_TOKEN"
+          #      token: "${SNOWFLAKE_OAUTH_TOKEN}"
+          #
+          # 5) EXTERNAL_BROWSER_AUTHENTICATOR — interactive SSO (local/dev only; it
+          #    cannot complete on the headless remote executor):
+          #      authentication_type: "EXTERNAL_BROWSER_AUTHENTICATOR"
 
         # ----------------------------------------------------------------
         # Persistent state tables
@@ -66,11 +106,15 @@ source:
           schema: "ACCESS_PROVISIONER"
           grants_table: "ACCESS_PROVISIONER_GRANTS"          # default
           sla_table: "ACCESS_PROVISIONER_SLA_NOTIFICATIONS"  # default
+          errors_table: "ACCESS_PROVISIONER_ERRORS"          # default; permanent-failure tombstones
+          ledger_table: "ACCESS_PROVISIONER_LEDGER"          # default; exactly-once notification ledger
 
         # ----------------------------------------------------------------
-        # SMTP (outbound email notifications) — defaults target Resend.
-        # For Resend: username is the literal "resend", password is your API
-        # key, and from_address MUST be a verified domain sender.
+        # SMTP (outbound email notifications) — OPTIONAL. Omit this whole block
+        # to disable all email notifications (approvals, denials, SLA reminders,
+        # revocations); provisioning, expiry and state tracking still run.
+        # Defaults target Resend: username is the literal "resend", password is
+        # your API key, and from_address MUST be a verified domain sender.
         # ----------------------------------------------------------------
         smtp:
           host: "smtp.resend.com"
@@ -96,6 +140,19 @@ source:
         expiry:
           enabled: true
           revocation_notification: true      # Email requestor on revocation
+
+        # ----------------------------------------------------------------
+        # Background reconciliation loop
+        # Re-runs the full catchup pass (approvals / expiry / SLA) on an
+        # interval so any live event missed while the process was down or
+        # rebalancing is still picked up within interval_seconds, rather than
+        # waiting for the next restart. Every pass is idempotent (state tables +
+        # the exactly-once ledger). Strongly recommended for long-lived daemon
+        # deployments; harmless (redundant) for purely scheduled invocations.
+        # ----------------------------------------------------------------
+        reconcile:
+          enabled: true
+          interval_seconds: 300              # worst-case delay for a missed event (min 30)
 
         # ----------------------------------------------------------------
         # Snowflake provisioning options

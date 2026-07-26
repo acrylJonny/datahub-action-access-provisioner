@@ -138,3 +138,32 @@ def test_send_revocation_notification(smtp_config):
         mock_smtp_cls.return_value.__enter__.return_value = mock_server
         send_revocation_notification(smtp_config, grant)
         mock_server.sendmail.assert_called_once()
+
+
+def test_notifications_are_optional_when_smtp_is_none(approved_request):
+    # With no SMTP configured, notifications must no-op — never open a connection.
+    with patch("action_access_provisioner.email.smtplib.SMTP") as mock_smtp_cls:
+        send_approval_notification(None, approved_request, ["GRANT ..."])
+        send_denial_notification(None, approved_request)
+        mock_smtp_cls.assert_not_called()
+
+
+def test_top_level_configs_parse_without_smtp():
+    from action_access_provisioner.config import (
+        AccessProvisionerConfig,
+        DatabricksAccessProvisionerConfig,
+        DatabricksConnectionConfig,
+        SnowflakeConnectionConfig,
+    )
+
+    sf = AccessProvisionerConfig(
+        snowflake_connection=SnowflakeConnectionConfig(account_id="acc", username="u")
+    )
+    assert sf.smtp is None
+
+    dbx = DatabricksAccessProvisionerConfig(
+        databricks_connection=DatabricksConnectionConfig(
+            host="https://h", http_path="/p", token="t"
+        )
+    )
+    assert dbx.smtp is None

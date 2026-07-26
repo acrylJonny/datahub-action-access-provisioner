@@ -62,3 +62,19 @@ INSERT_SLA_NOTIFICATION = (
     "  SELECT 1 FROM {table} WHERE ACTION_REQUEST_URN = %s AND NOTIFICATION_TYPE = %s"
     ")"
 )
+
+# ---------------------------------------------------------------------------
+# Processing ledger (exactly-once stage claims)
+# ---------------------------------------------------------------------------
+
+COUNT_LEDGER_STAGE = "SELECT COUNT(*) FROM {table} WHERE ACTION_REQUEST_URN = %s AND STAGE = %s"
+
+# Insert-if-absent. cur.rowcount is 1 when this call won the claim, 0 when the
+# stage was already claimed — that return value is the exactly-once gate.
+CLAIM_LEDGER_STAGE = (
+    "INSERT INTO {table} (ACTION_REQUEST_URN, STAGE, CLAIMED_AT) "
+    "SELECT %s, %s, CURRENT_TIMESTAMP() "
+    "WHERE NOT EXISTS ("
+    "  SELECT 1 FROM {table} WHERE ACTION_REQUEST_URN = %s AND STAGE = %s"
+    ")"
+)

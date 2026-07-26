@@ -124,3 +124,22 @@ USING (SELECT %(urn)s AS action_request_urn) AS s
 WHEN NOT MATCHED THEN INSERT (action_request_urn, error_code, error_message, failed_at_ms)
     VALUES (%(urn)s, %(code)s, %(msg)s, %(now)s)
 """
+
+# ---------------------------------------------------------------------------
+# Processing ledger (exactly-once stage claims)
+# ---------------------------------------------------------------------------
+
+COUNT_LEDGER_STAGE = (
+    "SELECT CAST(COUNT(*) AS STRING) FROM {table} "
+    "WHERE action_request_urn = %(urn)s AND stage = %(stage)s"
+)
+
+# Insert-if-absent claim. Delta MERGE is atomic; a re-run with the same
+# (urn, stage) matches the existing row and inserts nothing.
+CLAIM_LEDGER_STAGE = """
+MERGE INTO {table} AS t
+USING (SELECT %(urn)s AS action_request_urn, %(stage)s AS stage) AS s
+    ON t.action_request_urn = s.action_request_urn AND t.stage = s.stage
+WHEN NOT MATCHED THEN INSERT (action_request_urn, stage, claimed_at_ms)
+    VALUES (%(urn)s, %(stage)s, %(now)s)
+"""

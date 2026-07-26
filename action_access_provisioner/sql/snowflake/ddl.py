@@ -40,3 +40,15 @@ CREATE TABLE IF NOT EXISTS {table} (
     FAILED_AT             TIMESTAMP_NTZ NOT NULL
 )
 """
+
+# Processing ledger — one row per (request, stage) claimed exactly once. A stage
+# (e.g. approval_notified) is claimed BEFORE its side effect runs, so a replayed
+# or duplicate event can never send a second notification.
+LEDGER_TABLE = """
+CREATE TABLE IF NOT EXISTS {table} (
+    ACTION_REQUEST_URN    VARCHAR       NOT NULL,
+    STAGE                 VARCHAR       NOT NULL,
+    CLAIMED_AT            TIMESTAMP_NTZ NOT NULL,
+    PRIMARY KEY (ACTION_REQUEST_URN, STAGE)
+)
+"""

@@ -55,3 +55,14 @@ CREATE TABLE IF NOT EXISTS {table} (
     removed_at_ms             BIGINT
 ) USING DELTA
 """
+
+# Processing ledger — one row per (request, stage) claimed exactly once. A stage
+# (e.g. approval_notified) is claimed BEFORE its side effect runs, so a replayed
+# or duplicate event can never send a second notification.
+LEDGER_TABLE = """
+CREATE TABLE IF NOT EXISTS {table} (
+    action_request_urn STRING NOT NULL,
+    stage              STRING NOT NULL,
+    claimed_at_ms      BIGINT NOT NULL
+) USING DELTA
+"""

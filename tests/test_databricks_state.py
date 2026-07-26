@@ -6,6 +6,7 @@ import pytest
 
 from action_access_provisioner.config import DatabricksStateConfig
 from action_access_provisioner.databricks import (
+    claim_stage,
     ensure_state_tables,
     get_expired_grants,
     get_expired_memberships,
@@ -13,6 +14,7 @@ from action_access_provisioner.databricks import (
     is_membership_provisioned,
     is_provisioning_failed,
     is_sla_notified,
+    is_stage_processed,
     record_grant,
     record_membership,
     record_provisioning_error,
@@ -58,12 +60,41 @@ def test_ensure_state_tables_creates_all_tables(mock_conn, state_config):
     conn, cursor = mock_conn
     ensure_state_tables(conn, state_config)
     stmts = [c[0][0] for c in cursor.execute.call_args_list]
-    assert cursor.execute.call_count == 4
+    assert cursor.execute.call_count == 5
     assert any("access_provisioner_grants" in s for s in stmts)
     assert any("access_provisioner_sla_notifications" in s for s in stmts)
     assert any("access_provisioner_errors" in s for s in stmts)
     assert any("access_provisioner_group_memberships" in s for s in stmts)
+    assert any("access_provisioner_ledger" in s for s in stmts)
     assert all("USING DELTA" in s for s in stmts)
+
+
+def test_is_stage_processed_true(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)
+    assert (
+        is_stage_processed(conn, "urn:li:actionRequest:001", "approval_notified", state_config)
+        is True
+    )
+
+
+def test_claim_stage_dedups_when_already_claimed(mock_conn, state_config):
+    """A replayed event whose stage is already in the ledger must not run the MERGE insert."""
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)  # is_stage_processed -> True
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is False
+    # Only the COUNT ran; the MERGE insert was short-circuited.
+    assert cursor.execute.call_count == 1
+    assert "MERGE" not in cursor.execute.call_args[0][0].upper()
+
+
+def test_claim_stage_first_time_runs_merge(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("0",)  # is_stage_processed -> False
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is True
+    # COUNT then MERGE.
+    assert cursor.execute.call_count == 2
+    assert "MERGE" in cursor.execute.call_args[0][0].upper()
 
 
 def test_record_membership_merges_on_user_and_group(mock_conn, state_config):

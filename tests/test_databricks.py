@@ -4,6 +4,7 @@ import pytest
 
 from action_access_provisioner.config import DatabricksProvisioningConfig
 from action_access_provisioner.databricks import (
+    _principal,
     add_group_member,
     build_grant_statements,
     build_revoke_statements,
@@ -14,6 +15,28 @@ from action_access_provisioner.databricks import (
     revoke_access,
 )
 from action_access_provisioner.models import DatabricksGrantRecord
+
+
+def test_principal_quotes_group_names_with_spaces():
+    # Group display names legitimately contain spaces — they must not be rejected.
+    assert _principal("Data Analysts") == "`Data Analysts`"
+
+
+def test_principal_allows_email_and_service_principal():
+    assert _principal("jane.smith@corp.com") == "`jane.smith@corp.com`"
+    assert _principal("a1b2c3d4-0000-1111-2222-333344445555") == (
+        "`a1b2c3d4-0000-1111-2222-333344445555`"
+    )
+
+
+def test_principal_escapes_embedded_backticks():
+    # A backtick is doubled so the value cannot break out of the quoting.
+    assert _principal("weird`name") == "`weird``name`"
+
+
+def test_principal_rejects_control_characters():
+    with pytest.raises(ValueError):
+        _principal("bad\nname")
 
 
 @pytest.fixture

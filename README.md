@@ -58,7 +58,10 @@ Background threads (always running):
 - `acryl-datahub >= 1.0.0`
 - A Snowflake account — the configured user/role must have `GRANT OPTION` on
   the databases/schemas you intend to provision.
-- An SMTP provider for outbound email. Defaults target [Resend](https://resend.com)
+- _(Optional)_ An SMTP provider for outbound email. Email notifications are
+  optional: omit the `smtp` block entirely to disable all notifications
+  (approvals, denials, SLA reminders, revocations) — provisioning, expiry and
+  state tracking still run. Defaults target [Resend](https://resend.com)
   (username `resend`, password = your API key, and a verified domain sender for
   `from_address`); any SMTP server works by overriding `host`/`username`/`port`.
 
@@ -117,7 +120,7 @@ When creating the ingestion source in the DataHub Cloud UI, go to **Step 5 → A
 and add the following under **Extra Pip Libraries**:
 
 ```json
-["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.16/datahub_action_access_provisioner-0.1.16-py3-none-any.whl"]
+["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.20/datahub_action_access_provisioner-0.1.20-py3-none-any.whl"]
 ```
 
 Update the wheel URL to point to the [latest release](https://github.com/acrylJonny/datahub-action-access-provisioner/releases)
@@ -267,13 +270,69 @@ Sent SLA notifications are tracked in `ACCESS_PROVISIONER_SLA_NOTIFICATIONS`,
 keyed on `(ACTION_REQUEST_URN, NOTIFICATION_TYPE)`. Each warning/escalation
 fires at most once per request across all scheduled runs.
 
-### Scheduled invocation
+### Exactly-once side effects (processing ledger)
 
-Because the DataHub executor kills actions after ~30 seconds of idle time, this
-action should be run on a schedule (every 5–10 minutes is recommended). On each
-startup the action runs a full catchup pass — fetching recent approved requests
-and checking for expired grants and SLA breaches — before entering the live
-event-listening window.
+Grants themselves are idempotent — they are keyed on the natural access combo and
+reconciled with `MERGE`, so re-applying one is a no-op. One-shot **side effects**
+(approval / denial / revocation / membership emails) are not naturally idempotent,
+so they are gated by a processing ledger table `ACCESS_PROVISIONER_LEDGER`, keyed
+on `(ACTION_REQUEST_URN, STAGE)`. Each stage is _claimed_ (an insert-if-absent)
+**before** its notification is sent, so a duplicate live event, a replay after a
+restart, or a reconciliation pass overlapping a live event never sends a second
+email. `claim_stage()` returns `True` only to the caller that won the claim.
+
+### Delivery guarantees, reconciliation, and delay
+
+Live `actionRequestStatus` events are best-effort. An approval that lands while the
+process is down, mid-restart, or during a Kafka consumer rebalance can be missed by
+the live handler. A one-shot startup catchup only re-scans once per process, so on a
+long-lived daemon a missed event would otherwise wait until the next restart — which
+is how approvals can end up delayed by **days**.
+
+To bound that, the action runs a **background reconciliation loop** (on by default)
+that re-runs the full catchup/reconcile pass on a fixed interval:
+
+```yaml
+reconcile:
+  enabled: true # strongly recommended for long-lived daemon deployments
+  interval_seconds: 300 # worst-case delay for a missed live event (min 30)
+```
+
+Every pass is idempotent (state tables + the processing ledger), so re-scanning
+never re-grants or re-notifies. The reconciler and the live-event handler share a
+single warehouse connection and are serialised with a lock, so their cursors never
+race. Each reconcile pass isolates its phases (approvals / expiry / SLA): a transient
+failure in one phase is logged and retried on the next pass rather than aborting the
+others.
+
+### Deployment model: scheduled vs. daemon
+
+- **Long-lived daemon (recommended):** leave `reconcile.enabled: true`. Missed live
+  events are picked up within `interval_seconds` without waiting for a restart.
+- **Scheduled invocation:** if you instead run the action on a schedule (e.g. every
+  5–10 minutes, because the DataHub executor kills idle actions after ~30s), the
+  startup catchup on each run provides the same guarantee; the background loop is
+  redundant but harmless. On each startup the action runs a full catchup pass —
+  fetching recent approved requests and checking for expired grants and SLA breaches
+  — before entering the live event-listening window.
+
+### Snowflake connection & auth
+
+`snowflake_connection` supports the same authentication mechanisms as the DataHub
+Snowflake ingestion connector, selected via `authentication_type` (pick one):
+
+- **`DEFAULT_AUTHENTICATOR`** — `username` + `password`.
+- **`KEY_PAIR_AUTHENTICATOR`** — `username` + `private_key` (inline PEM) or
+  `private_key_path`, plus `private_key_password` if the key is encrypted.
+- **`OAUTH_AUTHENTICATOR`** — a token fetched from an IdP via `oauth_config`
+  (`provider: microsoft` or `okta`; secret- or, for Microsoft, certificate-based).
+- **`OAUTH_AUTHENTICATOR_TOKEN`** — a pre-minted OAuth `token`.
+- **`EXTERNAL_BROWSER_AUTHENTICATOR`** — interactive SSO; local/dev only, since it
+  cannot complete on the headless remote executor.
+
+`snowflake_domain` (use `snowflakecomputing.cn` for China regions) and `connect_args`
+(extra `snowflake.connector.connect` kwargs) are also supported. Microsoft OAuth
+needs the `msal` package — install the `snowflake-oauth` extra.
 
 ### Snowflake user requirements
 
@@ -408,12 +467,26 @@ permanent `INVALID_TARGET` failure rather than retried.
 
 ### Connection & auth
 
-A SQL warehouse (`http_path`) is always required: the Delta state/log tables live
-there, and (with `grant_method: sql`) GRANT/REVOKE statements run through it too.
-Two auth methods are supported:
+A SQL warehouse is always required (`http_path`, or `warehouse_id` to derive it):
+the Delta state/log tables live there, and (with `grant_method: sql`) GRANT/REVOKE
+statements run through it too. All authentication flows through the Databricks SDK
+credential chain — the same resolved credential drives both the SQL warehouse and
+the Unity Catalog grants API — so the provisioner supports the same mechanisms as
+the DataHub Unity Catalog ingestion connector (pick one):
 
 - **PAT** — set `token`.
-- **OAuth service principal** — set `client_id` + `client_secret`.
+- **OAuth M2M (Databricks service principal)** — set `client_id` + `client_secret`.
+- **Azure AD service principal** (Azure Databricks) — set `azure_auth` with
+  `client_id`, `tenant_id`, `client_secret`.
+- **Unified auth** — set none of the above; the SDK resolves credentials from its
+  default chain (environment variables / config profile).
+
+Requestor identity mapping: Unity Catalog grants target a principal (an email for
+an individual grant). The requestor's corpuser id is used directly when it is
+already an email; otherwise the email is read from the requestor's DataHub profile.
+Use `identity.principal_overrides` to map users whose DataHub id is neither (common
+with SSO), and `identity.resolve_email_from_datahub: false` to disable the profile
+lookup.
 
 `grant_method` selects how grants are applied:
 
@@ -434,6 +507,12 @@ All state lives in Unity Catalog Delta tables (default `datahub.access_provision
 - `access_provisioner_sla_notifications` — dedups SLA emails across runs.
 - `access_provisioner_errors` — records permanent provisioning failures (e.g. a
   missing catalog/principal) so they are not retried on every catchup pass.
+- `access_provisioner_group_memberships` — active group memberships (membership
+  access mode), keyed on `(user_email, group_name)`.
+- `access_provisioner_ledger` — processing ledger keyed on
+  `(action_request_urn, stage)` that guarantees exactly-once side effects: a
+  notification stage is claimed before its email is sent, so replayed or duplicate
+  events never send a second email.
 
 ### Databricks principal requirements
 

@@ -4,11 +4,13 @@
 #
 # This is the Databricks counterpart of example_action.yaml. It provisions
 # Unity Catalog grants (instead of Snowflake roles) and stores all state in
-# Delta tables. The scheduling model is identical: the DataHub Cloud executor
-# kills actions after ~5 minutes of idle time, so run this on a schedule
-# (e.g. every 30 minutes). Each run does a startup catchup pass (provision new
-# approvals, revoke expired grants, send SLA reminders) and then listens for
-# live events for the remaining window.
+# Delta tables. The durability model is identical: run as a long-lived daemon
+# (the background reconciliation loop re-runs the catchup pass on an interval,
+# picking up any missed live event within interval_seconds) or on a schedule
+# (e.g. every 30 minutes) where the startup catchup gives the same guarantee.
+# Each pass provisions new approvals, revokes expired grants, and sends SLA
+# reminders; all one-shot emails are gated by the exactly-once ledger so
+# duplicate or replayed events never notify twice.
 #
 # KEY DIFFERENCES FROM SNOWFLAKE
 # ------------------------------
@@ -34,16 +36,25 @@ source:
       config:
         # ----------------------------------------------------------------
         # Databricks connection (executes grants + holds Delta state tables)
-        # A SQL warehouse (http_path) is always required.
-        # Auth: PAT (token) OR OAuth service principal (client_id/secret).
+        # A SQL warehouse is always required — set http_path or warehouse_id.
+        # The same auth mechanisms as the Unity Catalog ingestion connector are
+        # supported (all flow through the SDK credential chain). Pick ONE:
         # ----------------------------------------------------------------
         databricks_connection:
           host: "https://dbc-xxxxxxxx-xxxx.cloud.databricks.com"
           http_path: "/sql/1.0/warehouses/abc123def456"
-          token: "${DATABRICKS_TOKEN}"            # PAT auth
-          # --- OR OAuth machine-to-machine (service principal) ---
+          # warehouse_id: "abc123def456"          # alternative to http_path
+          token: "${DATABRICKS_TOKEN}"            # 1) PAT auth
+          # --- 2) OAuth machine-to-machine (Databricks service principal) ---
           # client_id: "${DATABRICKS_CLIENT_ID}"
           # client_secret: "${DATABRICKS_CLIENT_SECRET}"
+          # --- 3) Azure AD service principal (Azure Databricks) ---
+          # azure_auth:
+          #   client_id: "${AZURE_CLIENT_ID}"
+          #   tenant_id: "${AZURE_TENANT_ID}"
+          #   client_secret: "${AZURE_CLIENT_SECRET}"
+          # --- 4) Unified auth: set none of the above and let the Databricks SDK
+          #        resolve credentials from its env vars / config profile chain. ---
 
         # ----------------------------------------------------------------
         # State / log tables (Delta, in Unity Catalog).
@@ -56,11 +67,14 @@ source:
           grants_table: "access_provisioner_grants"                 # default
           sla_table: "access_provisioner_sla_notifications"         # default
           errors_table: "access_provisioner_errors"                 # default
+          ledger_table: "access_provisioner_ledger"                 # default; exactly-once notification ledger
 
         # ----------------------------------------------------------------
-        # SMTP (outbound email notifications) — defaults target Resend.
-        # For Resend: username is the literal "resend", password is your API
-        # key, and from_address MUST be a verified domain sender.
+        # SMTP (outbound email notifications) — OPTIONAL. Omit this whole block
+        # to disable all email notifications (approvals, denials, SLA reminders,
+        # revocations); provisioning, expiry and state tracking still run.
+        # Defaults target Resend: username is the literal "resend", password is
+        # your API key, and from_address MUST be a verified domain sender.
         # ----------------------------------------------------------------
         smtp:
           host: "smtp.resend.com"
@@ -85,6 +99,16 @@ source:
         expiry:
           enabled: true
           revocation_notification: true
+
+        # ----------------------------------------------------------------
+        # Background reconciliation loop — re-runs the catchup pass on an
+        # interval so a live event missed while the process was down or
+        # rebalancing is picked up within interval_seconds. Idempotent (state
+        # tables + exactly-once ledger). Recommended for daemon deployments.
+        # ----------------------------------------------------------------
+        reconcile:
+          enabled: true
+          interval_seconds: 300              # worst-case delay for a missed event (min 30)
 
         # ----------------------------------------------------------------
         # Databricks provisioning options
@@ -117,9 +141,23 @@ source:
         #   dry_run: false
 
         # ----------------------------------------------------------------
+        # Optional: how DataHub requestors map to Databricks principals (emails).
+        # By default the corpuser id is used when it is already an email, otherwise
+        # the email is read from the requestor's DataHub profile. Add explicit
+        # overrides for users whose DataHub id is neither (common with SSO).
+        # ----------------------------------------------------------------
+        # identity:
+        #   resolve_email_from_datahub: true
+        #   principal_overrides:
+        #     "urn:li:corpuser:jsmith": "jane.smith@corp.com"
+        #     "bkumar": "bharat.kumar@corp.com"
+
+        # ----------------------------------------------------------------
         # Optional: mirror granted access back into DataHub as role/actors/access
         # aspects for a queryable "who has access" audit view. Read-only mirror of
-        # Unity Catalog — editing DataHub never changes Databricks.
+        # Unity Catalog — editing DataHub never changes Databricks. Both group grants
+        # (urn:li:role:<prefix>.<group>) and individual user grants
+        # (urn:li:role:<prefix>.user.<email>) are mirrored.
         # ----------------------------------------------------------------
         # datahub_sync:
         #   enabled: true              # off by default

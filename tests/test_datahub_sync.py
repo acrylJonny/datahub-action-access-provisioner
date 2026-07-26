@@ -112,3 +112,32 @@ def test_group_revoke_removes_association_without_deleting_role():
     assert access.roles == []
     # The role itself is left intact — other datasets may still reference it.
     assert _emitted(graph, RolePropertiesClass) == []
+
+
+_USER_ROLE_URN = "urn:li:role:databricks.user.alice@example.com"
+
+
+def test_user_grant_mints_per_user_role_and_dataset_access():
+    graph = FakeGraph()
+    _sync(graph).on_user_grant("alice@example.com", "prod", "sales", "orders")
+
+    props = _emitted(graph, RolePropertiesClass)
+    assert len(props) == 1 and props[0].name == "alice@example.com"
+
+    actors = _emitted(graph, ActorsClass)[-1]
+    assert [u.user for u in actors.users] == [_USER_URN]
+
+    access = _emitted(graph, AccessClass)[-1]
+    assert [r.urn for r in access.roles] == [_USER_ROLE_URN]
+    assert graph.emitted[-1].entityUrn == _DATASET_URN
+
+
+def test_user_revoke_removes_association_without_deleting_role():
+    graph = FakeGraph(
+        {(_DATASET_URN, AccessClass): AccessClass(roles=[RoleAssociationClass(urn=_USER_ROLE_URN)])}
+    )
+    _sync(graph).on_user_revoke("alice@example.com", "prod", "sales", "orders")
+
+    access = _emitted(graph, AccessClass)[-1]
+    assert access.roles == []
+    assert _emitted(graph, RolePropertiesClass) == []

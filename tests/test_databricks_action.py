@@ -34,6 +34,25 @@ def base_config_dict():
     }
 
 
+@pytest.fixture(autouse=True)
+def _default_ledger_and_guards():
+    """Default the exactly-once ledger claim (True = first time), the permanent-failure
+    guard (False = not failed), and a stub SQL connection so existing tests exercise the
+    normal path, and stub the background reconciler so create() never spawns a real thread.
+    Tests that assert dedup or failure-skip behaviour override these with an inner patch."""
+    from action_access_provisioner.databricks_access_provisioner_action import (
+        DatabricksAccessProvisionerAction,
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.claim_stage", return_value=True),
+        patch(f"{_ACTION_MODULE}.dbx.is_provisioning_failed", return_value=False),
+        patch(f"{_ACTION_MODULE}.dbx.get_sql_connection", return_value=MagicMock()),
+        patch.object(DatabricksAccessProvisionerAction, "_start_reconciler"),
+    ):
+        yield
+
+
 def _make_request(form_fields, *, resource=None, requestor="urn:li:corpuser:alice@example.com"):
     return AccessRequest(
         urn="urn:li:actionRequest:approved-001",
@@ -472,5 +491,81 @@ def test_sync_disabled_by_default_skips_mirror(base_config_dict, mock_pipeline_c
         action._provision(request)
 
     mock_sync_cls.assert_not_called()
+
+    action.close()
+
+
+# ---------------------------------------------------------------------------
+# Durability / exactly-once
+# ---------------------------------------------------------------------------
+
+
+def test_live_path_skips_permanent_failure(base_config_dict, mock_pipeline_context):
+    """A live approval for a request already recorded as a permanent failure must not
+    re-attempt provisioning."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = _make_request(
+        FormFieldValues(access_duration_days=30),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.fetch_action_request", return_value=request),
+        patch.object(action, "_already_provisioned", return_value=False),
+        patch(f"{_ACTION_MODULE}.dbx.is_provisioning_failed", return_value=True),
+        patch.object(action, "_provision") as mock_provision,
+    ):
+        action._handle_status_change(request.urn)
+        mock_provision.assert_not_called()
+
+    action.close()
+
+
+def test_denial_email_deduped_when_stage_claimed(base_config_dict, mock_pipeline_context):
+    """A replayed denial event whose stage is already claimed must not send a second email."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    denied = AccessRequest(
+        urn="urn:li:actionRequest:denied-002",
+        status="COMPLETED",
+        result="REJECTED",
+        note=None,
+        request_type="WORKFLOW_FORM_REQUEST",
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.hr.employees,PROD)",
+        requestor_urn="urn:li:corpuser:bob@example.com",
+        created_ms=int(time.time() * 1000),
+        due_date_ms=None,
+        form_fields=FormFieldValues(),
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.fetch_action_request", return_value=denied),
+        patch(f"{_ACTION_MODULE}.dbx.claim_stage", return_value=False),
+        patch(f"{_ACTION_MODULE}.send_denial_notification") as mock_email,
+    ):
+        action._handle_status_change(denied.urn)
+        mock_email.assert_not_called()
+
+    action.close()
+
+
+def test_provision_approval_email_deduped_when_stage_claimed(
+    base_config_dict, mock_pipeline_context
+):
+    """If the approval-notification stage was already claimed, no second approval email."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = _make_request(
+        FormFieldValues(access_duration_days=30),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.get_sql_connection", return_value=MagicMock()),
+        patch(f"{_ACTION_MODULE}.dbx.provision_access", return_value=[]),
+        patch(f"{_ACTION_MODULE}.dbx.record_grant"),
+        patch(f"{_ACTION_MODULE}.dbx.claim_stage", return_value=False),
+        patch.object(action, "_send_approval") as mock_send,
+    ):
+        action._provision(request)
+        mock_send.assert_not_called()
 
     action.close()

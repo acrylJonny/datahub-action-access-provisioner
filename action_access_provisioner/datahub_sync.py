@@ -88,6 +88,11 @@ class DatahubSync:
     def _role_urn(self, group: str) -> str:
         return f"urn:li:role:{self.config.role_urn_prefix}.{group}"
 
+    def _user_role_urn(self, user_email: str) -> str:
+        # Individual grants are modelled as a single-actor role so the dataset's access
+        # aspect (which associates roles, not raw users) can point at exactly one user.
+        return f"urn:li:role:{self.config.role_urn_prefix}.user.{user_email}"
+
     def _dataset_urn(self, catalog: str, schema: str, table: str) -> str:
         # catalog/schema/table come straight off the dataset URN the request was raised
         # on, so they already match DataHub's stored (lowercased) identifiers.
@@ -124,6 +129,20 @@ class DatahubSync:
         """A user's membership expired — remove them from the role's actors."""
         self._upsert_actors(self._role_urn(group), remove_users=[make_user_urn(user_email)])
 
+    def on_user_grant(self, user_email: str, catalog: str, schema: str, table: str) -> None:
+        """An individual user was GRANTed access to a table — record a per-user role
+        (with the user as its sole actor) and link it to the dataset."""
+        self._ensure_user_role(user_email)
+        self._modify_access(
+            self._dataset_urn(catalog, schema, table), self._user_role_urn(user_email), add=True
+        )
+
+    def on_user_revoke(self, user_email: str, catalog: str, schema: str, table: str) -> None:
+        """An individual user's grant expired — drop the dataset→role association."""
+        self._modify_access(
+            self._dataset_urn(catalog, schema, table), self._user_role_urn(user_email), add=False
+        )
+
     # -- internals -------------------------------------------------------
 
     def _emit(self, entity_urn: str, aspect: _Aspect) -> None:
@@ -133,6 +152,23 @@ class DatahubSync:
         self._ensure_role_properties(group)
         # Represent the Databricks group itself as an actor group on the role.
         self._upsert_actors(self._role_urn(group), add_groups=[make_group_urn(group)])
+
+    def _ensure_user_role(self, user_email: str) -> None:
+        role_urn = self._user_role_urn(user_email)
+        if self._graph.get_aspect(role_urn, RolePropertiesClass) is None:
+            self._emit(
+                role_urn,
+                RolePropertiesClass(
+                    name=user_email,
+                    type=_ROLE_TYPE_READ,
+                    description=(
+                        f"Databricks Unity Catalog direct grant to user '{user_email}' "
+                        "(mirrored by DataHub access provisioner)"
+                    ),
+                    requestUrl=self.config.request_url,
+                ),
+            )
+        self._upsert_actors(role_urn, add_users=[make_user_urn(user_email)])
 
     def _ensure_role_properties(self, group: str) -> None:
         role_urn = self._role_urn(group)
