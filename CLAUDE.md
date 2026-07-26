@@ -169,7 +169,7 @@ pytest -m integration    # integration tests (live DataHub + Snowflake required)
 pytest --cov=action_access_provisioner  # with coverage
 ```
 
-Unit tests mock the Snowflake connector and DataHub GraphQL calls via `pytest-mock`. The `freezegun` fixture is used to control time in expiry and SLA tests.
+Unit tests mock the Snowflake connector and DataHub GraphQL calls via `pytest-mock`. Use `time_machine` (`time_machine.travel(...)`) to control time in expiry and SLA tests.
 
 ## Commits
 
