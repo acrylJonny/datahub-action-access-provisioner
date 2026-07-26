@@ -1,5 +1,7 @@
 import logging
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 from datahub_actions.action.action import Action
@@ -8,11 +10,20 @@ from datahub_actions.event.event_registry import MetadataChangeLogEvent
 from datahub_actions.pipeline.pipeline_context import PipelineContext
 
 from action_access_provisioner import databricks as dbx
-from action_access_provisioner.config import DatabricksAccessProvisionerConfig
+from action_access_provisioner.config import (
+    DatabricksAccessProvisionerConfig,
+    GroupAccessMode,
+    TicketingConfig,
+    TicketingMode,
+)
+from action_access_provisioner.datahub_sync import DatahubSync
 from action_access_provisioner.email import (
     send_dbx_approval_notification,
+    send_dbx_membership_notification,
+    send_dbx_membership_removal_notification,
     send_dbx_provisioning_failure_notification,
     send_dbx_revocation_notification,
+    send_dbx_ticket_notification,
     send_denial_notification,
     send_escalation_alert,
     send_sla_warning,
@@ -22,13 +33,20 @@ from action_access_provisioner.graphql import (
     fetch_all_approved_requests,
     fetch_pending_action_requests,
 )
+from action_access_provisioner.identity import resolve_databricks_principal
 from action_access_provisioner.models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
+    LEDGER_STAGE_APPROVAL_NOTIFIED,
+    LEDGER_STAGE_DENIAL_NOTIFIED,
+    LEDGER_STAGE_MEMBERSHIP_NOTIFIED,
+    LEDGER_STAGE_MEMBERSHIP_REMOVAL_NOTIFIED,
+    LEDGER_STAGE_REVOCATION_NOTIFIED,
     AccessRequest,
     DatabricksGrantRecord,
+    DatabricksGroupMembershipRecord,
     PendingRequestSummary,
-    corpuser_email_from_urn,
 )
+from action_access_provisioner.ticketing import TicketResult, create_access_ticket
 
 logger = logging.getLogger(__name__)
 
@@ -36,6 +54,14 @@ _ASPECT_ACTION_REQUEST_STATUS = "actionRequestStatus"
 
 _SLA_TYPE_WARNING = "warning"
 _SLA_TYPE_ESCALATION = "escalation"
+
+
+def _is_group_principal(principal: str) -> bool:
+    # A grant's principal is either a Databricks group name or an individual
+    # corpuser email; group names are never email addresses, so the absence of an
+    # "@" distinguishes the two. ponytail: heuristic — the upgrade path is to persist
+    # the principal kind on the grant record instead of inferring it.
+    return "@" not in principal
 
 
 class DatabricksAccessProvisionerAction(Action):
@@ -46,6 +72,14 @@ class DatabricksAccessProvisionerAction(Action):
         self.ctx = ctx
         self._sql_conn: Any = None
         self._workspace_client: Any = None
+        self._datahub_sync: DatahubSync | None = None
+        # A single SQL connection is shared between the live-event thread and the
+        # background reconciler; the connector is not safe for concurrent cursor use,
+        # so all connection access is serialised through this lock. ponytail: coarse
+        # lock — fine at this request volume; upgrade path is a connection pool.
+        self._lock = threading.RLock()
+        self._stop = threading.Event()
+        self._reconcile_thread: threading.Thread | None = None
 
         logger.info("[DatabricksAccessProvisioner] Initialised")
         if config.provisioning.dry_run:
@@ -60,28 +94,76 @@ class DatabricksAccessProvisionerAction(Action):
         config = DatabricksAccessProvisionerConfig.model_validate(config_dict or {})
         action = cls(config, ctx)
         action._startup_catchup()
+        action._start_reconciler()
         return action
 
     # ------------------------------------------------------------------
-    # Startup catchup pass
+    # Startup catchup + background reconciliation
     # ------------------------------------------------------------------
 
     def _startup_catchup(self) -> None:
+        """Run one reconcile pass at startup (backlog of approvals, expiry, SLA)."""
         logger.info("[Catchup] Starting startup catchup pass…")
-        try:
-            conn = self._get_sql_conn()
-            dbx.ensure_state_tables(conn, self.config.state)
-        except Exception as exc:
-            logger.error(
-                f"[Catchup] Cannot connect to Databricks or create state tables: {exc}",
-                exc_info=True,
-            )
-            return
-
-        self._catchup_approved_requests()
-        self._catchup_expiry()
-        self._catchup_sla()
+        self._reconcile_once()
         logger.info("[Catchup] Startup catchup pass complete")
+
+    def _start_reconciler(self) -> None:
+        """Start the background loop that re-runs the reconcile pass on an interval.
+
+        Live ``actionRequestStatus`` events are best-effort; anything missed while the
+        process is down, restarting, or during a consumer rebalance would otherwise wait
+        until the next process restart (which, for a long-lived daemon, can be days). This
+        loop bounds that delay to ``reconcile.interval_seconds``. Every pass is idempotent,
+        so it never re-grants or re-notifies.
+        """
+        if not self.config.reconcile.enabled:
+            logger.info("[Reconcile] Background reconciliation disabled by config")
+            return
+        interval = self.config.reconcile.interval_seconds
+
+        def _loop() -> None:
+            # Event.wait doubles as the sleep and the shutdown signal: it returns True
+            # only once close() sets the stop event, cleanly ending the loop.
+            while not self._stop.wait(interval):
+                try:
+                    self._reconcile_once()
+                except Exception as exc:
+                    logger.error(f"[Reconcile] Reconciliation pass failed: {exc}", exc_info=True)
+
+        self._reconcile_thread = threading.Thread(
+            target=_loop, name="databricks-access-provisioner-reconcile", daemon=True
+        )
+        self._reconcile_thread.start()
+        logger.info(f"[Reconcile] Background reconciliation every {interval}s")
+
+    def _reconcile_once(self) -> None:
+        """One reconcile pass: ensure tables, then provision backlog / expire / SLA.
+
+        Holds the connection lock for the whole pass so it never races the live-event
+        handler. Each phase is isolated: a transient failure in one phase (or the initial
+        connect) is logged and the next scheduled pass retries, rather than aborting the
+        others.
+        """
+        with self._lock:
+            try:
+                conn = self._get_sql_conn()
+                dbx.ensure_state_tables(conn, self.config.state)
+            except Exception as exc:
+                logger.error(
+                    f"[Reconcile] Cannot connect to Databricks or create state tables: {exc}",
+                    exc_info=True,
+                )
+                return
+
+            for phase in (
+                self._catchup_approved_requests,
+                self._catchup_expiry,
+                self._catchup_sla,
+            ):
+                try:
+                    phase()
+                except Exception as exc:
+                    logger.error(f"[Reconcile] Phase {phase.__name__} failed: {exc}", exc_info=True)
 
     def _catchup_approved_requests(self) -> None:
         approved = fetch_all_approved_requests(
@@ -92,7 +174,7 @@ class DatabricksAccessProvisionerAction(Action):
         conn = self._get_sql_conn()
         new_count = 0
         for request in approved:
-            if dbx.is_already_provisioned(conn, request.urn, self.config.state):
+            if self._already_provisioned(conn, request.urn):
                 logger.debug(f"[Catchup] {request.urn} already provisioned — skipping")
                 continue
             if dbx.is_provisioning_failed(conn, request.urn, self.config.state):
@@ -128,11 +210,57 @@ class DatabricksAccessProvisionerAction(Action):
                 )
                 continue
 
-            if self.config.expiry.revocation_notification:
+            # Mirror the revocation at table granularity — group grant or individual user.
+            if grant.schema_name and grant.table:
+                if _is_group_principal(grant.principal):
+                    self._mirror_group_revoke(
+                        grant.principal, grant.catalog, grant.schema_name, grant.table
+                    )
+                else:
+                    self._mirror_user_revoke(
+                        grant.principal, grant.catalog, grant.schema_name, grant.table
+                    )
+
+            if self.config.expiry.revocation_notification and dbx.claim_stage(
+                conn, grant.action_request_urn, LEDGER_STAGE_REVOCATION_NOTIFIED, self.config.state
+            ):
                 try:
                     send_dbx_revocation_notification(self.config.smtp, grant)
                 except Exception as exc:
                     logger.error(f"[Expiry] Failed to send revocation email: {exc}")
+
+        for membership in dbx.get_expired_memberships(conn, self.config.state):
+            logger.info(
+                f"[Expiry] Removing expired membership for {membership.action_request_urn} "
+                f"({membership.user_email} -> {membership.group_name})"
+            )
+            try:
+                dbx.remove_group_member(
+                    self._require_workspace_client(),
+                    membership.group_name,
+                    membership.user_email,
+                    dry_run=self.config.provisioning.dry_run,
+                )
+                dbx.record_membership_removal(conn, membership, self.config.state)
+            except Exception as exc:
+                logger.error(
+                    f"[Expiry] Failed to remove membership {membership.action_request_urn}: {exc}",
+                    exc_info=True,
+                )
+                continue
+
+            self._mirror_membership_remove(membership.group_name, membership.user_email)
+
+            if self.config.expiry.revocation_notification and dbx.claim_stage(
+                conn,
+                membership.action_request_urn,
+                LEDGER_STAGE_MEMBERSHIP_REMOVAL_NOTIFIED,
+                self.config.state,
+            ):
+                try:
+                    send_dbx_membership_removal_notification(self.config.smtp, membership)
+                except Exception as exc:
+                    logger.error(f"[Expiry] Failed to send membership removal email: {exc}")
 
     def _catchup_sla(self) -> None:
         pending = fetch_pending_action_requests(self.ctx.graph, self._field_id_map())
@@ -160,7 +288,9 @@ class DatabricksAccessProvisionerAction(Action):
             return
 
         logger.debug(f"[Live] actionRequestStatus change on {entity_urn}")
-        self._handle_status_change(entity_urn)
+        # Serialise with the background reconciler — both share one SQL connection.
+        with self._lock:
+            self._handle_status_change(entity_urn)
 
     def _handle_status_change(self, action_request_urn: str) -> None:
         request = fetch_action_request(self.ctx.graph, action_request_urn, self._field_id_map())
@@ -172,13 +302,27 @@ class DatabricksAccessProvisionerAction(Action):
 
         if request.is_approved:
             conn = self._get_sql_conn()
-            if dbx.is_already_provisioned(conn, action_request_urn, self.config.state):
+            if self._already_provisioned(conn, action_request_urn):
                 logger.info(
                     f"[Live] {action_request_urn} already provisioned — skipping duplicate event"
                 )
                 return
+            # Parity with the catchup path: never re-attempt a request already recorded
+            # as a permanent failure (e.g. invalid target, object does not exist).
+            if dbx.is_provisioning_failed(conn, action_request_urn, self.config.state):
+                logger.info(
+                    f"[Live] {action_request_urn} has a permanent provisioning failure — skipping"
+                )
+                return
             self._provision(request)
         elif request.is_denied:
+            # Claim the denial-notification stage first so a duplicate/replayed event
+            # never sends a second denial email.
+            conn = self._get_sql_conn()
+            if not dbx.claim_stage(
+                conn, action_request_urn, LEDGER_STAGE_DENIAL_NOTIFIED, self.config.state
+            ):
+                return
             try:
                 send_denial_notification(self.config.smtp, request)
             except Exception as exc:
@@ -189,7 +333,26 @@ class DatabricksAccessProvisionerAction(Action):
     # ------------------------------------------------------------------
 
     def _provision(self, request: AccessRequest) -> None:
-        principal = self._resolve_principal(request)
+        # The requestor's email is always the notification recipient; it is also the
+        # grantee unless the form requested a group (group-based access).
+        requestor_email = self._resolve_requestor_email(request)
+
+        ticketing = self.config.ticketing
+        # 'replace' mode hands fulfilment to the ITSM tool, so no grant is issued.
+        replace = ticketing is not None and ticketing.mode == TicketingMode.REPLACE
+
+        # Membership access model: add the requestor to the requested group rather
+        # than granting the object directly. Replace-mode ticketing still wins.
+        group = request.form_fields.databricks_group
+        if (
+            not replace
+            and group
+            and self.config.provisioning.group_access_mode == GroupAccessMode.MEMBERSHIP
+        ):
+            self._provision_membership(request, requestor_email, group)
+            return
+
+        principal = self._resolve_grantee(request, requestor_email)
         # The grant target (catalog.schema.table) is derived from the dataset the
         # request was raised on — never from form fields — so it always matches the
         # entity and any platform_instance prefix is stripped (see the parser).
@@ -213,24 +376,48 @@ class DatabricksAccessProvisionerAction(Action):
         )
 
         conn = self._get_sql_conn()
-        try:
-            statements = dbx.provision_access(
-                sql_conn=conn,
-                workspace_client=self._get_workspace_client(),
-                principal=principal,
-                catalog=catalog,
-                schema=schema,
-                table=table,
-                provisioning=self.config.provisioning,
-            )
-            logger.info(f"[Provision] {len(statements)} grant(s) applied for {request.urn}")
-        except Exception as exc:
-            logger.error(f"[Provision] Databricks error for {request.urn}: {exc}", exc_info=True)
-            self._handle_provision_failure(conn, request, exc, principal, catalog, schema, table)
-            return
 
+        statements: list[str] = []
+        if not replace:
+            try:
+                statements = dbx.provision_access(
+                    sql_conn=conn,
+                    workspace_client=self._get_workspace_client(),
+                    principal=principal,
+                    catalog=catalog,
+                    schema=schema,
+                    table=table,
+                    provisioning=self.config.provisioning,
+                )
+                logger.info(f"[Provision] {len(statements)} grant(s) applied for {request.urn}")
+            except Exception as exc:
+                logger.error(
+                    f"[Provision] Databricks error for {request.urn}: {exc}", exc_info=True
+                )
+                self._handle_provision_failure(
+                    conn, request, exc, requestor_email, catalog, schema, table
+                )
+                return
+
+        ticket: TicketResult | None = None
+        if ticketing is not None:
+            try:
+                ticket = self._open_ticket(ticketing, request, principal, catalog, schema, table)
+                logger.info(
+                    f"[Provision] Opened {ticketing.provider} ticket {ticket.key} for {request.urn}"
+                )
+            except Exception as exc:
+                logger.error(
+                    f"[Provision] Failed to open ticket for {request.urn}: {exc}", exc_info=True
+                )
+                if replace:
+                    # The ticket is the only fulfilment in replace mode; with none
+                    # filed there is nothing to record, so let the next catchup retry.
+                    return
+
+        # In replace mode no grant was issued, so there is nothing to auto-revoke.
         expires_at_ms: int | None = None
-        if request.form_fields.access_duration_days:
+        if not replace and request.form_fields.access_duration_days:
             expires_at_ms = (
                 int(time.time() * 1000) + request.form_fields.access_duration_days * 86_400_000
             )
@@ -239,9 +426,11 @@ class DatabricksAccessProvisionerAction(Action):
             action_request_urn=request.urn,
             principal=principal,
             catalog=catalog,
-            schema=schema,
+            schema_name=schema,
             table=table,
-            requestor_email=principal,
+            # The grantee may be a group, but notifications (incl. expiry) always go
+            # to the human who raised the request.
+            requestor_email=requestor_email,
             granted_at_ms=int(time.time() * 1000),
             expires_at_ms=expires_at_ms,
         )
@@ -250,11 +439,195 @@ class DatabricksAccessProvisionerAction(Action):
         except Exception as exc:
             logger.error(f"[Provision] Failed to record grant state for {request.urn}: {exc}")
 
+        # Mirror the grant into DataHub for a queryable "who has access" audit view:
+        # a group grant records the group role, an individual grant records a per-user role.
+        if not replace:
+            if group:
+                self._mirror_group_grant(group, catalog, schema, table)
+            else:
+                self._mirror_user_grant(principal, catalog, schema, table)
+
+        # Claim the approval-notification stage before sending: if record_grant failed
+        # above and a later pass re-provisions (grants are idempotent), the email is still
+        # sent exactly once.
+        if dbx.claim_stage(conn, request.urn, LEDGER_STAGE_APPROVAL_NOTIFIED, self.config.state):
+            self._send_approval(
+                request,
+                requestor_email,
+                principal,
+                catalog,
+                schema,
+                table,
+                statements,
+                ticket,
+                replace,
+            )
+
+    def _already_provisioned(self, conn: Any, action_request_urn: str) -> bool:
+        # A request is fulfilled by either an object grant or a group membership;
+        # both are keyed on the action-request URN.
+        return dbx.is_already_provisioned(
+            conn, action_request_urn, self.config.state
+        ) or dbx.is_membership_provisioned(conn, action_request_urn, self.config.state)
+
+    def _provision_membership(
+        self, request: AccessRequest, requestor_email: str | None, group: str
+    ) -> None:
+        if not requestor_email:
+            logger.error(
+                f"[Provision] Request {request.urn} has no requestor email — "
+                f"cannot add to group {group!r}; skipping"
+            )
+            return
+        logger.info(
+            f"[Provision] membership: add {requestor_email} to group {group} "
+            f"for request {request.urn}"
+        )
+        conn = self._get_sql_conn()
         try:
+            dbx.add_group_member(
+                self._require_workspace_client(),
+                group,
+                requestor_email,
+                dry_run=self.config.provisioning.dry_run,
+            )
+        except Exception as exc:
+            logger.error(
+                f"[Provision] Failed to add {requestor_email} to group {group} "
+                f"for {request.urn}: {exc}",
+                exc_info=True,
+            )
+            self._handle_membership_failure(conn, request, exc, requestor_email, group)
+            return
+
+        expires_at_ms: int | None = None
+        if request.form_fields.access_duration_days:
+            expires_at_ms = (
+                int(time.time() * 1000) + request.form_fields.access_duration_days * 86_400_000
+            )
+        membership = DatabricksGroupMembershipRecord(
+            action_request_urn=request.urn,
+            user_email=requestor_email,
+            group_name=group,
+            added_at_ms=int(time.time() * 1000),
+            expires_at_ms=expires_at_ms,
+        )
+        try:
+            dbx.record_membership(conn, membership, self.config.state)
+        except Exception as exc:
+            logger.error(f"[Provision] Failed to record membership state for {request.urn}: {exc}")
+
+        self._mirror_membership_add(group, requestor_email)
+
+        if dbx.claim_stage(conn, request.urn, LEDGER_STAGE_MEMBERSHIP_NOTIFIED, self.config.state):
+            try:
+                send_dbx_membership_notification(
+                    self.config.smtp,
+                    request,
+                    recipient=requestor_email,
+                    member=requestor_email,
+                    group=group,
+                )
+            except Exception as exc:
+                logger.error(f"[Provision] Failed to send membership email: {exc}")
+
+    def _handle_membership_failure(
+        self,
+        conn: Any,
+        request: AccessRequest,
+        exc: Exception,
+        recipient: str | None,
+        group: str,
+    ) -> None:
+        if not dbx.is_permanent_databricks_error(exc):
+            return
+        already_notified = False
+        try:
+            already_notified = dbx.is_provisioning_failed(conn, request.urn, self.config.state)
+        except Exception:
+            pass
+        try:
+            dbx.record_provisioning_error(conn, request.urn, None, str(exc), self.config.state)
+        except Exception as rec_exc:
+            logger.error(f"[Provision] Failed to record error state for {request.urn}: {rec_exc}")
+        if not already_notified:
+            try:
+                send_dbx_provisioning_failure_notification(
+                    self.config.smtp,
+                    request,
+                    str(exc),
+                    recipient=recipient,
+                    catalog=group,
+                    schema="(group membership)",
+                    table="",
+                )
+            except Exception as mail_exc:
+                logger.error(
+                    f"[Provision] Failed to send failure notification for {request.urn}: {mail_exc}"
+                )
+
+    def _open_ticket(
+        self,
+        ticketing: TicketingConfig,
+        request: AccessRequest,
+        principal: str,
+        catalog: str,
+        schema: str | None,
+        table: str | None,
+    ) -> TicketResult:
+        target = f"{catalog}.{schema}.{table}" if table else f"{catalog}.{schema or '(all)'}"
+        duration = (
+            f"{request.form_fields.access_duration_days} days"
+            if request.form_fields.access_duration_days
+            else "Indefinite"
+        )
+        summary = f"DataHub access request: {target} for {principal}"
+        description = (
+            "Access requested via DataHub.\n\n"
+            f"Grantee: {principal}\n"
+            f"Unity Catalog target: {target}\n"
+            f"DataHub resource: {request.resource}\n"
+            f"Requested duration: {duration}\n"
+            f"Justification: {request.form_fields.justification or '—'}\n"
+            f"Action request: {request.urn}"
+        )
+        return create_access_ticket(ticketing, summary=summary, description=description)
+
+    def _send_approval(
+        self,
+        request: AccessRequest,
+        recipient: str | None,
+        principal: str,
+        catalog: str,
+        schema: str,
+        table: str,
+        statements: list[str],
+        ticket: TicketResult | None,
+        replace: bool,
+    ) -> None:
+        try:
+            if replace and ticket is not None:
+                send_dbx_ticket_notification(
+                    self.config.smtp,
+                    request,
+                    recipient=recipient,
+                    principal=principal,
+                    catalog=catalog,
+                    schema=schema,
+                    table=table,
+                    ticket_key=ticket.key,
+                    ticket_url=ticket.url,
+                )
+                return
+            display = list(statements)
+            if ticket is not None:
+                ref = f"{ticket.key} ({ticket.url})" if ticket.url else ticket.key
+                display = [f"Ticket opened: {ref}", *display]
             send_dbx_approval_notification(
                 self.config.smtp,
                 request,
-                statements,
+                display,
+                recipient=recipient,
                 principal=principal,
                 catalog=catalog,
                 schema=schema,
@@ -283,7 +656,7 @@ class DatabricksAccessProvisionerAction(Action):
         conn: Any,
         request: AccessRequest,
         exc: Exception,
-        principal: str,
+        recipient: str | None,
         catalog: str,
         schema: str,
         table: str,
@@ -305,7 +678,7 @@ class DatabricksAccessProvisionerAction(Action):
                     self.config.smtp,
                     request,
                     str(exc),
-                    principal=principal,
+                    recipient=recipient,
                     catalog=catalog,
                     schema=schema,
                     table=table,
@@ -365,16 +738,26 @@ class DatabricksAccessProvisionerAction(Action):
 
     def _field_id_map(self) -> dict[str, str]:
         # The grant target comes from the dataset entity, so only the remaining
-        # form fields (duration, justification) need mapping here.
+        # form fields (duration, justification, optional group) need mapping here.
         return {
             "field_access_duration_days": self.config.field_access_duration_days,
             "field_justification": self.config.field_justification,
+            "field_databricks_group": self.config.field_databricks_group,
         }
 
+    def _resolve_requestor_email(self, request: AccessRequest) -> str | None:
+        """The requestor's Databricks principal (email) — the notification recipient,
+        and the grantee when no group is requested. Resolves via the identity config
+        (explicit override, email-form URN, or the DataHub corpuser profile)."""
+        return resolve_databricks_principal(
+            self.ctx.graph, request.requestor_urn, self.config.identity
+        )
+
     @staticmethod
-    def _resolve_principal(request: AccessRequest) -> str | None:
-        """The Databricks principal is the requestor's corpuser email identity."""
-        return corpuser_email_from_urn(request.requestor_urn)
+    def _resolve_grantee(request: AccessRequest, requestor_email: str | None) -> str | None:
+        """The Databricks principal the grant is applied to: an explicitly requested
+        group (group-based access) or, by default, the requestor's own identity."""
+        return request.form_fields.databricks_group or requestor_email
 
     def _get_sql_conn(self) -> Any:
         if self._sql_conn is None:
@@ -388,19 +771,71 @@ class DatabricksAccessProvisionerAction(Action):
         # never require the databricks-sdk grants path.
         if self.config.provisioning.grant_method != "sdk":
             return None
+        return self._require_workspace_client()
+
+    def _require_workspace_client(self) -> Any:
+        # Group-membership changes always go through the SDK (SCIM), regardless of
+        # the SQL/SDK grant_method used for object grants.
         if self._workspace_client is None:
             self._workspace_client = self.config.databricks_connection.get_workspace_client()
         return self._workspace_client
+
+    # ------------------------------------------------------------------
+    # DataHub access mirror (audit) — read-only write-back, never mutates UC
+    # ------------------------------------------------------------------
+
+    def _sync(self) -> DatahubSync | None:
+        if not self.config.datahub_sync.enabled:
+            return None
+        if self._datahub_sync is None:
+            self._datahub_sync = DatahubSync(self.ctx.graph, self.config.datahub_sync)
+        return self._datahub_sync
+
+    def _mirror(self, action: Callable[[DatahubSync], None]) -> None:
+        """Run a mirror operation, swallowing errors — the audit view must never break
+        provisioning."""
+        sync = self._sync()
+        if sync is None:
+            return
+        try:
+            action(sync)
+        except Exception as exc:
+            logger.error(f"[Sync] DataHub mirror failed (access unaffected): {exc}")
+
+    def _mirror_group_grant(self, group: str, catalog: str, schema: str, table: str) -> None:
+        self._mirror(lambda s: s.on_group_grant(group, catalog, schema, table))
+
+    def _mirror_group_revoke(self, group: str, catalog: str, schema: str, table: str) -> None:
+        self._mirror(lambda s: s.on_group_revoke(group, catalog, schema, table))
+
+    def _mirror_membership_add(self, group: str, user_email: str) -> None:
+        self._mirror(lambda s: s.on_membership_add(group, user_email))
+
+    def _mirror_membership_remove(self, group: str, user_email: str) -> None:
+        self._mirror(lambda s: s.on_membership_remove(group, user_email))
+
+    def _mirror_user_grant(self, user_email: str, catalog: str, schema: str, table: str) -> None:
+        self._mirror(lambda s: s.on_user_grant(user_email, catalog, schema, table))
+
+    def _mirror_user_revoke(self, user_email: str, catalog: str, schema: str, table: str) -> None:
+        self._mirror(lambda s: s.on_user_revoke(user_email, catalog, schema, table))
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        if self._sql_conn:
-            try:
-                self._sql_conn.close()
-            except Exception:
-                pass
-            self._sql_conn = None
+        # Signal the reconciler to stop and wait for any in-flight pass to finish so we
+        # never close the connection out from under it.
+        self._stop.set()
+        if self._reconcile_thread is not None:
+            self._reconcile_thread.join(timeout=30)
+            self._reconcile_thread = None
+        with self._lock:
+            if self._sql_conn:
+                try:
+                    self._sql_conn.close()
+                except Exception:
+                    pass
+                self._sql_conn = None
         logger.info("[DatabricksAccessProvisioner] Closed")

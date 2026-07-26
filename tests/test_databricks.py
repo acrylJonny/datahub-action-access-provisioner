@@ -4,14 +4,39 @@ import pytest
 
 from action_access_provisioner.config import DatabricksProvisioningConfig
 from action_access_provisioner.databricks import (
+    _principal,
+    add_group_member,
     build_grant_statements,
     build_revoke_statements,
     is_permanent_databricks_error,
     parse_databricks_dataset_urn,
     provision_access,
+    remove_group_member,
     revoke_access,
 )
 from action_access_provisioner.models import DatabricksGrantRecord
+
+
+def test_principal_quotes_group_names_with_spaces():
+    # Group display names legitimately contain spaces — they must not be rejected.
+    assert _principal("Data Analysts") == "`Data Analysts`"
+
+
+def test_principal_allows_email_and_service_principal():
+    assert _principal("jane.smith@corp.com") == "`jane.smith@corp.com`"
+    assert _principal("a1b2c3d4-0000-1111-2222-333344445555") == (
+        "`a1b2c3d4-0000-1111-2222-333344445555`"
+    )
+
+
+def test_principal_escapes_embedded_backticks():
+    # A backtick is doubled so the value cannot break out of the quoting.
+    assert _principal("weird`name") == "`weird``name`"
+
+
+def test_principal_rejects_control_characters():
+    with pytest.raises(ValueError):
+        _principal("bad\nname")
 
 
 @pytest.fixture
@@ -90,7 +115,7 @@ def test_revoke_statements_only_select_at_granted_level():
         action_request_urn="urn:li:actionRequest:001",
         principal="alice@example.com",
         catalog="prod",
-        schema="sales",
+        schema_name="sales",
         table=None,
         requestor_email="alice@example.com",
         granted_at_ms=0,
@@ -160,7 +185,7 @@ def test_revoke_sql_executes(sql_conn):
         action_request_urn="urn:li:actionRequest:002",
         principal="bob@example.com",
         catalog="prod",
-        schema=None,
+        schema_name=None,
         table=None,
         requestor_email="bob@example.com",
         granted_at_ms=0,
@@ -174,6 +199,47 @@ def test_revoke_sql_executes(sql_conn):
     )
     cursor.execute.assert_called_once()
     assert "REVOKE SELECT ON CATALOG `prod`" in cursor.execute.call_args[0][0]
+
+
+# ---------------------------------------------------------------------------
+# Group membership (SCIM)
+# ---------------------------------------------------------------------------
+
+
+def _membership_client(group_id="grp-1", user_id="usr-1"):
+    wc = MagicMock()
+    wc.groups.list.return_value = [MagicMock(id=group_id)]
+    wc.users.list.return_value = [MagicMock(id=user_id)]
+    return wc
+
+
+def test_add_group_member_patches_group():
+    pytest.importorskip("databricks.sdk.service")
+    wc = _membership_client()
+    add_group_member(wc, "analytics_team", "alice@example.com", dry_run=False)
+    wc.groups.patch.assert_called_once()
+    assert wc.groups.patch.call_args.kwargs["id"] == "grp-1"
+
+
+def test_remove_group_member_patches_group():
+    pytest.importorskip("databricks.sdk.service")
+    wc = _membership_client()
+    remove_group_member(wc, "analytics_team", "alice@example.com", dry_run=False)
+    wc.groups.patch.assert_called_once()
+
+
+def test_add_group_member_dry_run_skips_api():
+    wc = MagicMock()
+    add_group_member(wc, "analytics_team", "alice@example.com", dry_run=True)
+    wc.groups.patch.assert_not_called()
+
+
+def test_add_group_member_raises_when_group_missing():
+    pytest.importorskip("databricks.sdk.service")
+    wc = MagicMock()
+    wc.groups.list.return_value = []
+    with pytest.raises(ValueError):
+        add_group_member(wc, "missing_group", "alice@example.com", dry_run=False)
 
 
 # ---------------------------------------------------------------------------

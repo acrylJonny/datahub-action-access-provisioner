@@ -71,32 +71,45 @@ def fetch_pending_action_requests(
     config_field_ids: dict[str, str],
     batch_size: int = 100,
 ) -> list[PendingRequestSummary]:
-    """List all PENDING workflow access requests from DataHub."""
-    variables = {
-        "input": {
-            "start": 0,
-            "count": batch_size,
-            "type": ACTION_REQUEST_TYPE_WORKFLOW,
-            "status": REQUEST_STATUS_PENDING,
-            "allActionRequests": True,
+    """List all PENDING workflow access requests from DataHub.
+
+    Paginates through the full result set — SLA reminders and escalations would
+    otherwise be silently missed for any request beyond the first page.
+    """
+    pending: list[PendingRequestSummary] = []
+    start = 0
+
+    while True:
+        variables = {
+            "input": {
+                "start": start,
+                "count": batch_size,
+                "type": ACTION_REQUEST_TYPE_WORKFLOW,
+                "status": REQUEST_STATUS_PENDING,
+                "allActionRequests": True,
+            }
         }
-    }
 
-    try:
-        raw = _execute_graphql(graph, LIST_ACTION_REQUESTS_QUERY, variables=variables)
-    except Exception as exc:
-        logger.error(f"GraphQL error fetching pending requests: {exc}")
-        return []
+        try:
+            raw = _execute_graphql(graph, LIST_ACTION_REQUESTS_QUERY, variables=variables)
+        except Exception as exc:
+            logger.error(f"GraphQL error fetching pending requests (start={start}): {exc}")
+            break
 
-    try:
-        data = GqlListActionRequestsData.model_validate(raw or {})
-    except ValidationError as exc:
-        logger.error(f"Failed to parse listActionRequests response: {exc}")
-        return []
+        try:
+            data = GqlListActionRequestsData.model_validate(raw or {})
+        except ValidationError as exc:
+            logger.error(f"Failed to parse listActionRequests response (start={start}): {exc}")
+            break
 
-    return [
-        ar.to_pending_summary(config_field_ids) for ar in data.listActionRequests.actionRequests
-    ]
+        result = data.listActionRequests
+        pending.extend(ar.to_pending_summary(config_field_ids) for ar in result.actionRequests)
+
+        start += len(result.actionRequests)
+        if start >= result.total or not result.actionRequests:
+            break
+
+    return pending
 
 
 def fetch_all_approved_requests(

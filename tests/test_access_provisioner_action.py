@@ -107,6 +107,26 @@ def denied_request():
     )
 
 
+_MODULE = "action_access_provisioner.access_provisioner_action"
+
+
+@pytest.fixture(autouse=True)
+def _default_ledger_and_guards():
+    """Default the exactly-once ledger claim (True = first time) and the permanent-failure
+    guard (False = not failed) so existing tests exercise the normal path, and stub the
+    background reconciler so create() never spawns a real thread. Tests that assert dedup
+    or failure-skip behaviour override these with an inner patch."""
+    from action_access_provisioner.access_provisioner_action import AccessProvisionerAction
+
+    with (
+        patch(f"{_MODULE}.claim_stage", return_value=True),
+        patch(f"{_MODULE}.is_provisioning_failed", return_value=False),
+        patch(f"{_MODULE}.get_connection", return_value=MagicMock()),
+        patch.object(AccessProvisionerAction, "_start_reconciler"),
+    ):
+        yield
+
+
 # ---------------------------------------------------------------------------
 # Factory / catchup
 # ---------------------------------------------------------------------------
@@ -620,5 +640,83 @@ def test_expiry_catchup_revokes_and_notifies(base_config_dict, mock_pipeline_con
             action.config.state,
         )
         mock_notify.assert_called_once()
+
+    action.close()
+
+
+# ---------------------------------------------------------------------------
+# Durability / exactly-once
+# ---------------------------------------------------------------------------
+
+
+def test_handle_status_change_skips_permanent_failure(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    """A live approval for a request already recorded as a permanent failure must not
+    re-attempt provisioning (parity with the catchup path)."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(f"{_MODULE}.fetch_action_request", return_value=approved_request),
+        patch(f"{_MODULE}.is_already_provisioned", return_value=False),
+        patch(f"{_MODULE}.is_provisioning_failed", return_value=True),
+        patch.object(action, "_provision") as mock_provision,
+    ):
+        action._handle_status_change(approved_request.urn)
+        mock_provision.assert_not_called()
+
+    action.close()
+
+
+def test_provision_approval_email_deduped_when_stage_claimed(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    """If the approval-notification stage was already claimed (duplicate/replayed
+    event), the approval email is not sent again."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(f"{_MODULE}.provision_access", return_value=["GRANT ..."]),
+        patch(f"{_MODULE}.record_grant"),
+        patch(f"{_MODULE}.claim_stage", return_value=False),
+        patch(f"{_MODULE}.send_approval_notification") as mock_email,
+    ):
+        action._provision(approved_request)
+        mock_email.assert_not_called()
+
+    action.close()
+
+
+def test_denial_email_deduped_when_stage_claimed(
+    base_config_dict, mock_pipeline_context, denied_request
+):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(f"{_MODULE}.fetch_action_request", return_value=denied_request),
+        patch(f"{_MODULE}.claim_stage", return_value=False),
+        patch(f"{_MODULE}.send_denial_notification") as mock_email,
+    ):
+        action._handle_status_change(denied_request.urn)
+        mock_email.assert_not_called()
+
+    action.close()
+
+
+def test_provision_missing_database_records_tombstone(
+    base_config_dict, mock_pipeline_context, approved_request
+):
+    """A missing database is a permanent form/mapping error: it must record a tombstone
+    so the catchup pass stops retrying it forever."""
+    approved_request.form_fields.snowflake_database = None
+    action = _create_action(base_config_dict, mock_pipeline_context)
+
+    with (
+        patch(f"{_MODULE}.provision_access") as mock_provision,
+        patch(f"{_MODULE}.record_provisioning_error") as mock_err,
+    ):
+        action._provision(approved_request)
+        mock_provision.assert_not_called()
+        assert mock_err.call_args[0][2] == "MISSING_FIELDS"
 
     action.close()

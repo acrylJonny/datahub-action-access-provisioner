@@ -5,19 +5,27 @@ from unittest.mock import MagicMock
 import pytest
 
 from action_access_provisioner.config import DatabricksStateConfig
-from action_access_provisioner.constants import SCHEMA_ALL, TABLE_ALL
 from action_access_provisioner.databricks import (
+    claim_stage,
     ensure_state_tables,
     get_expired_grants,
+    get_expired_memberships,
     is_already_provisioned,
+    is_membership_provisioned,
     is_provisioning_failed,
     is_sla_notified,
+    is_stage_processed,
     record_grant,
+    record_membership,
     record_provisioning_error,
     record_revocation,
     record_sla_notification,
 )
-from action_access_provisioner.models import DatabricksGrantRecord
+from action_access_provisioner.models import (
+    DatabricksGrantRecord,
+    DatabricksGroupMembershipRecord,
+)
+from action_access_provisioner.sql.databricks.ddl import SCHEMA_ALL, TABLE_ALL
 
 
 @pytest.fixture
@@ -40,7 +48,7 @@ def grant_with_expiry():
         action_request_urn="urn:li:actionRequest:001",
         principal="alice@example.com",
         catalog="prod",
-        schema="sales",
+        schema_name="sales",
         table=None,
         requestor_email="alice@example.com",
         granted_at_ms=int(time.time() * 1000),
@@ -48,15 +56,82 @@ def grant_with_expiry():
     )
 
 
-def test_ensure_state_tables_creates_three_tables(mock_conn, state_config):
+def test_ensure_state_tables_creates_all_tables(mock_conn, state_config):
     conn, cursor = mock_conn
     ensure_state_tables(conn, state_config)
     stmts = [c[0][0] for c in cursor.execute.call_args_list]
-    assert cursor.execute.call_count == 3
+    assert cursor.execute.call_count == 5
     assert any("access_provisioner_grants" in s for s in stmts)
     assert any("access_provisioner_sla_notifications" in s for s in stmts)
     assert any("access_provisioner_errors" in s for s in stmts)
+    assert any("access_provisioner_group_memberships" in s for s in stmts)
+    assert any("access_provisioner_ledger" in s for s in stmts)
     assert all("USING DELTA" in s for s in stmts)
+
+
+def test_is_stage_processed_true(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)
+    assert (
+        is_stage_processed(conn, "urn:li:actionRequest:001", "approval_notified", state_config)
+        is True
+    )
+
+
+def test_claim_stage_dedups_when_already_claimed(mock_conn, state_config):
+    """A replayed event whose stage is already in the ledger must not run the MERGE insert."""
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)  # is_stage_processed -> True
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is False
+    # Only the COUNT ran; the MERGE insert was short-circuited.
+    assert cursor.execute.call_count == 1
+    assert "MERGE" not in cursor.execute.call_args[0][0].upper()
+
+
+def test_claim_stage_first_time_runs_merge(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("0",)  # is_stage_processed -> False
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is True
+    # COUNT then MERGE.
+    assert cursor.execute.call_count == 2
+    assert "MERGE" in cursor.execute.call_args[0][0].upper()
+
+
+def test_record_membership_merges_on_user_and_group(mock_conn, state_config):
+    conn, cursor = mock_conn
+    membership = DatabricksGroupMembershipRecord(
+        action_request_urn="urn:li:actionRequest:m1",
+        user_email="alice@example.com",
+        group_name="analytics_team",
+        added_at_ms=int(time.time() * 1000),
+        expires_at_ms=int(time.time() * 1000) + 14 * 86_400_000,
+    )
+    record_membership(conn, membership, state_config)
+    sql = cursor.execute.call_args[0][0]
+    assert "MERGE INTO" in sql
+    assert "user_email" in sql and "group_name" in sql
+
+
+def test_get_expired_memberships_parses_rows(mock_conn, state_config):
+    conn, cursor = mock_conn
+    # Connector returns the CAST(... AS STRING) bigint columns as strings.
+    cursor.fetchall.return_value = [
+        ("urn:li:actionRequest:m1", "alice@example.com", "analytics_team", "1000", "2000")
+    ]
+    expired = get_expired_memberships(conn, state_config)
+    assert len(expired) == 1
+    assert expired[0].user_email == "alice@example.com"
+    assert expired[0].group_name == "analytics_team"
+    assert expired[0].expires_at_ms == 2000
+
+
+def test_is_membership_provisioned_uses_urn_and_removed_guard(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)
+    assert is_membership_provisioned(conn, "urn:li:actionRequest:m1", state_config) is True
+    sql = cursor.execute.call_args[0][0]
+    assert "latest_action_request_urn" in sql
+    assert "removed_at_ms IS NULL" in sql
 
 
 def test_is_already_provisioned_uses_urn_and_revoked_guard(mock_conn, state_config):
@@ -85,7 +160,7 @@ def test_record_grant_no_expiry_inlines_null_and_omits_param(mock_conn, state_co
         action_request_urn="urn:li:actionRequest:002",
         principal="alice@example.com",
         catalog="prod",
-        schema=None,
+        schema_name=None,
         table=None,
         requestor_email=None,
         granted_at_ms=int(time.time() * 1000),
@@ -115,7 +190,7 @@ def test_get_expired_grants_converts_sentinels_back_to_none(mock_conn, state_con
     ]
     grants = get_expired_grants(conn, state_config)
     assert len(grants) == 1
-    assert grants[0].schema is None
+    assert grants[0].schema_name is None
     assert grants[0].table is None
     # Timestamps arrive as strings (CAST AS STRING) but are parsed back to int.
     assert grants[0].granted_at_ms == 1000

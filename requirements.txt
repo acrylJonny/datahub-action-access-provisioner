@@ -14,4 +14,4 @@ pytest>=7.0.0
 pytest-cov>=4.0.0
 pytest-mock>=3.10.0
 types-PyYAML
-freezegun>=1.2.0
+time-machine>=2.10.0

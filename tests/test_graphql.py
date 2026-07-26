@@ -10,7 +10,10 @@ from action_access_provisioner.gql_types import (
     GqlListActionRequestsData,
     GqlWorkflowFormRequest,
 )
-from action_access_provisioner.graphql import fetch_action_request
+from action_access_provisioner.graphql import (
+    fetch_action_request,
+    fetch_pending_action_requests,
+)
 from action_access_provisioner.models import REQUEST_RESULT_APPROVED, REQUEST_STATUS_COMPLETED
 
 # ---------------------------------------------------------------------------
@@ -27,6 +30,7 @@ def field_id_map() -> dict[str, str]:
         "field_access_duration_days": "access_duration_days",
         "field_requestor_email": "requestor_email",
         "field_justification": "justification",
+        "field_databricks_group": "databricks_group",
     }
 
 
@@ -161,6 +165,14 @@ def test_to_form_field_values_invalid_duration_falls_back_to_none(field_id_map):
     assert ff.access_duration_days is None
 
 
+def test_to_form_field_values_parses_optional_databricks_group(field_id_map):
+    wf = GqlWorkflowFormRequest.model_validate(
+        {"fields": [_str_field("databricks_group", "analytics_team")]}
+    )
+    ff = wf.to_form_field_values(field_id_map)
+    assert ff.databricks_group == "analytics_team"
+
+
 # ---------------------------------------------------------------------------
 # GqlActionRequest.to_access_request
 # ---------------------------------------------------------------------------
@@ -285,3 +297,68 @@ def test_fetch_action_request_returns_none_on_exception(field_id_map):
 
     req = fetch_action_request(mock_graph, "urn:li:actionRequest:999", field_id_map)
     assert req is None
+
+
+# ---------------------------------------------------------------------------
+# fetch_pending_action_requests — pagination (SLA must see every pending request)
+# ---------------------------------------------------------------------------
+
+
+def _pending_dict(urn: str) -> dict:
+    raw = _make_action_request_dict(status="PENDING", result=None)
+    raw["urn"] = urn
+    return raw
+
+
+def test_fetch_pending_paginates_all_pages(field_id_map):
+    """A pending backlog larger than one page must be fully walked, or SLA reminders
+    for later requests are silently dropped."""
+    mock_graph = MagicMock()
+    mock_graph.execute_graphql.side_effect = [
+        {
+            "listActionRequests": {
+                "total": 3,
+                "actionRequests": [
+                    _pending_dict("urn:li:actionRequest:1"),
+                    _pending_dict("urn:li:actionRequest:2"),
+                ],
+            }
+        },
+        {
+            "listActionRequests": {
+                "total": 3,
+                "actionRequests": [_pending_dict("urn:li:actionRequest:3")],
+            }
+        },
+    ]
+
+    pending = fetch_pending_action_requests(mock_graph, field_id_map, batch_size=2)
+
+    assert [p.urn for p in pending] == [
+        "urn:li:actionRequest:1",
+        "urn:li:actionRequest:2",
+        "urn:li:actionRequest:3",
+    ]
+    assert mock_graph.execute_graphql.call_count == 2
+    # Second page must request the correct offset.
+    second_vars = mock_graph.execute_graphql.call_args_list[1].kwargs["variables"]
+    assert second_vars["input"]["start"] == 2
+
+
+def test_fetch_pending_stops_on_empty_page(field_id_map):
+    """An overstated total must not cause an infinite loop: an empty page ends pagination."""
+    mock_graph = MagicMock()
+    mock_graph.execute_graphql.side_effect = [
+        {
+            "listActionRequests": {
+                "total": 99,
+                "actionRequests": [_pending_dict("urn:li:actionRequest:1")],
+            }
+        },
+        {"listActionRequests": {"total": 99, "actionRequests": []}},
+    ]
+
+    pending = fetch_pending_action_requests(mock_graph, field_id_map, batch_size=1)
+
+    assert [p.urn for p in pending] == ["urn:li:actionRequest:1"]
+    assert mock_graph.execute_graphql.call_count == 2

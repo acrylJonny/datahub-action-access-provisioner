@@ -5,20 +5,22 @@ from unittest.mock import MagicMock
 import pytest
 
 from action_access_provisioner.config import StateConfig
-from action_access_provisioner.constants import SCHEMA_ALL as _SCHEMA_ALL
 from action_access_provisioner.models import GrantRecord
 from action_access_provisioner.snowflake import (
+    claim_stage,
     ensure_state_tables,
     get_expired_grants,
     is_already_provisioned,
     is_permanent_snowflake_error,
     is_provisioning_failed,
     is_sla_notified,
+    is_stage_processed,
     record_grant,
     record_provisioning_error,
     record_revocation,
     record_sla_notification,
 )
+from action_access_provisioner.sql.snowflake.ddl import SCHEMA_ALL as _SCHEMA_ALL
 
 
 @pytest.fixture
@@ -67,14 +69,15 @@ def grant_no_expiry():
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_state_tables_creates_both_tables(mock_conn, state_config):
+def test_ensure_state_tables_creates_all_tables(mock_conn, state_config):
     conn, cursor = mock_conn
     ensure_state_tables(conn, state_config)
-    assert cursor.execute.call_count == 3
+    assert cursor.execute.call_count == 4
     stmts = [c[0][0] for c in cursor.execute.call_args_list]
     assert any("ACCESS_PROVISIONER_GRANTS" in s for s in stmts)
     assert any("ACCESS_PROVISIONER_SLA_NOTIFICATIONS" in s for s in stmts)
     assert any("ACCESS_PROVISIONER_ERRORS" in s for s in stmts)
+    assert any("ACCESS_PROVISIONER_LEDGER" in s for s in stmts)
 
 
 # ---------------------------------------------------------------------------
@@ -350,3 +353,44 @@ def test_is_permanent_snowflake_error_false_for_other_errno():
 
 def test_is_permanent_snowflake_error_false_for_plain_exception():
     assert is_permanent_snowflake_error(ValueError("boom")) is False
+
+
+# ---------------------------------------------------------------------------
+# Processing ledger — exactly-once claim
+# ---------------------------------------------------------------------------
+
+
+def test_is_stage_processed_true(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (1,)
+    assert (
+        is_stage_processed(conn, "urn:li:actionRequest:001", "approval_notified", state_config)
+        is True
+    )
+
+
+def test_is_stage_processed_false(mock_conn, state_config):
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (0,)
+    assert (
+        is_stage_processed(conn, "urn:li:actionRequest:001", "approval_notified", state_config)
+        is False
+    )
+
+
+def test_claim_stage_first_time_wins(mock_conn, state_config):
+    """First claim: not yet in ledger, INSERT affects one row -> True."""
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (0,)  # is_stage_processed -> False
+    cursor.rowcount = 1
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is True
+
+
+def test_claim_stage_dedups_when_already_claimed(mock_conn, state_config):
+    """A replayed event whose stage is already in the ledger must not re-claim (no INSERT)."""
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = (1,)  # is_stage_processed -> True
+    assert claim_stage(conn, "urn:li:actionRequest:001", "approval_notified", state_config) is False
+    # Only the COUNT ran; the INSERT was short-circuited.
+    assert cursor.execute.call_count == 1
+    assert "INSERT" not in cursor.execute.call_args[0][0].upper()

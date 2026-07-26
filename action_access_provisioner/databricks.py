@@ -9,14 +9,12 @@ from action_access_provisioner.config import (
     DatabricksProvisioningConfig,
     DatabricksStateConfig,
 )
-from action_access_provisioner.constants import (
-    DDL_DBX_ERRORS_TABLE,
-    DDL_DBX_GRANTS_TABLE,
-    DDL_DBX_SLA_TABLE,
-    SCHEMA_ALL,
-    TABLE_ALL,
+from action_access_provisioner.models import (
+    DatabricksGrantRecord,
+    DatabricksGroupMembershipRecord,
 )
-from action_access_provisioner.models import DatabricksGrantRecord
+from action_access_provisioner.sql.databricks import dcl, ddl, dml
+from action_access_provisioner.sql.databricks.ddl import SCHEMA_ALL, TABLE_ALL
 
 logger = logging.getLogger(__name__)
 
@@ -24,8 +22,9 @@ logger = logging.getLogger(__name__)
 # the values, which originate from user-submitted form fields, can be safely
 # inlined into GRANT statements (identifiers cannot be passed as bind params).
 _IDENT_RE = re.compile(r"^[A-Za-z0-9_]+$")
-# Principals are emails / usernames / group names.
-_PRINCIPAL_RE = re.compile(r"^[A-Za-z0-9_.@+\-]+$")
+# Control characters are never valid in a principal and would let a value break out
+# of the backtick quoting, so they are rejected outright.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f]")
 
 
 def _ident(name: str) -> str:
@@ -66,10 +65,16 @@ def parse_databricks_dataset_urn(urn: str | None) -> tuple[str, str, str] | None
 
 
 def _principal(name: str) -> str:
-    """Validate and backtick-quote a Databricks principal (user/group/SP)."""
-    if not name or not _PRINCIPAL_RE.match(name):
+    """Backtick-quote a Databricks principal (user email / group name / service principal).
+
+    Group display names legitimately contain spaces and other punctuation, so rather
+    than restrict the character set we escape any embedded backticks (Spark SQL doubles
+    them) and reject only control characters. The value always comes from a trusted
+    DataHub identity or a configured group name, not free-form request text.
+    """
+    if not name or _CONTROL_CHARS_RE.search(name):
         raise ValueError(f"Invalid Databricks principal: {name!r}")
-    return f"`{name}`"
+    return "`" + name.replace("`", "``") + "`"
 
 
 @contextmanager
@@ -101,21 +106,23 @@ def build_grant_statements(
     """
     p = _principal(principal)
     c = _ident(catalog)
-    statements = [f"GRANT USE CATALOG ON CATALOG {c} TO {p}"]
+    statements = [dcl.GRANT_USE_CATALOG.format(catalog=c, principal=p)]
 
     if schema:
         s = _ident(schema)
-        statements.append(f"GRANT USE SCHEMA ON SCHEMA {c}.{s} TO {p}")
+        statements.append(dcl.GRANT_USE_SCHEMA_ON_SCHEMA.format(catalog=c, schema=s, principal=p))
         if table:
             t = _ident(table)
-            statements.append(f"GRANT SELECT ON TABLE {c}.{s}.{t} TO {p}")
+            statements.append(
+                dcl.GRANT_SELECT_ON_TABLE.format(catalog=c, schema=s, table=t, principal=p)
+            )
         else:
-            statements.append(f"GRANT SELECT ON SCHEMA {c}.{s} TO {p}")
+            statements.append(dcl.GRANT_SELECT_ON_SCHEMA.format(catalog=c, schema=s, principal=p))
     else:
         # Whole-catalog access — USE SCHEMA / SELECT granted at the catalog level
         # are inherited by every current and future schema and table.
-        statements.append(f"GRANT USE SCHEMA ON CATALOG {c} TO {p}")
-        statements.append(f"GRANT SELECT ON CATALOG {c} TO {p}")
+        statements.append(dcl.GRANT_USE_SCHEMA_ON_CATALOG.format(catalog=c, principal=p))
+        statements.append(dcl.GRANT_SELECT_ON_CATALOG.format(catalog=c, principal=p))
 
     return statements
 
@@ -130,13 +137,13 @@ def build_revoke_statements(grant: DatabricksGrantRecord) -> list[str]:
     """
     p = _principal(grant.principal)
     c = _ident(grant.catalog)
-    if grant.schema:
-        s = _ident(grant.schema)
+    if grant.schema_name:
+        s = _ident(grant.schema_name)
         if grant.table:
             t = _ident(grant.table)
-            return [f"REVOKE SELECT ON TABLE {c}.{s}.{t} FROM {p}"]
-        return [f"REVOKE SELECT ON SCHEMA {c}.{s} FROM {p}"]
-    return [f"REVOKE SELECT ON CATALOG {c} FROM {p}"]
+            return [dcl.REVOKE_SELECT_ON_TABLE.format(catalog=c, schema=s, table=t, principal=p)]
+        return [dcl.REVOKE_SELECT_ON_SCHEMA.format(catalog=c, schema=s, principal=p)]
+    return [dcl.REVOKE_SELECT_ON_CATALOG.format(catalog=c, principal=p)]
 
 
 # ---------------------------------------------------------------------------
@@ -249,13 +256,68 @@ def revoke_access(
             workspace_client,
             grant.principal,
             grant.catalog,
-            grant.schema,
+            grant.schema_name,
             grant.table,
             revoke=True,
         )
     else:
         _execute_sql_batch(sql_conn, statements)
     return statements
+
+
+# ---------------------------------------------------------------------------
+# Group membership (the "add the requestor to a group" access model)
+# ---------------------------------------------------------------------------
+
+
+def _resolve_group_id(workspace_client, group_name: str) -> str:
+    for group in workspace_client.groups.list(filter=f'displayName eq "{group_name}"'):
+        if group.id:
+            return str(group.id)
+    raise ValueError(f"Databricks group not found: {group_name!r}")
+
+
+def _resolve_user_id(workspace_client, user_email: str) -> str:
+    for user in workspace_client.users.list(filter=f'userName eq "{user_email}"'):
+        if user.id:
+            return str(user.id)
+    raise ValueError(f"Databricks user not found: {user_email!r}")
+
+
+def add_group_member(workspace_client, group_name: str, user_email: str, *, dry_run: bool) -> None:
+    """Add a user to a Databricks group via the SCIM groups API."""
+    if dry_run:
+        logger.info(f"[DRY RUN] Would add {user_email} to group {group_name}")
+        return
+    # ponytail: SCIM Patch shape is pinned to databricks-sdk's iam service; if the
+    # bundled SDK changes the Patch/PatchOp signature this is the single call to fix.
+    from databricks.sdk.service import iam
+
+    group_id = _resolve_group_id(workspace_client, group_name)
+    user_id = _resolve_user_id(workspace_client, user_email)
+    workspace_client.groups.patch(
+        id=group_id,
+        operations=[iam.Patch(op=iam.PatchOp.ADD, value={"members": [{"value": user_id}]})],
+        schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+    )
+
+
+def remove_group_member(
+    workspace_client, group_name: str, user_email: str, *, dry_run: bool
+) -> None:
+    """Remove a user from a Databricks group via the SCIM groups API."""
+    if dry_run:
+        logger.info(f"[DRY RUN] Would remove {user_email} from group {group_name}")
+        return
+    from databricks.sdk.service import iam
+
+    group_id = _resolve_group_id(workspace_client, group_name)
+    user_id = _resolve_user_id(workspace_client, user_email)
+    workspace_client.groups.patch(
+        id=group_id,
+        operations=[iam.Patch(op=iam.PatchOp.REMOVE, path=f'members[value eq "{user_id}"]')],
+        schemas=[iam.PatchSchema.URN_IETF_PARAMS_SCIM_API_MESSAGES_2_0_PATCH_OP],
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -267,29 +329,55 @@ def revoke_access(
 
 
 def ensure_state_tables(conn, state: DatabricksStateConfig) -> None:
-    """Create the grants, SLA, and errors Delta tables if they don't exist."""
+    """Create the grants, SLA, errors, memberships, and ledger Delta tables if absent."""
     with _cursor(conn) as cur:
-        cur.execute(DDL_DBX_GRANTS_TABLE.format(table=state.qualified_grants_table))
-        cur.execute(DDL_DBX_SLA_TABLE.format(table=state.qualified_sla_table))
-        cur.execute(DDL_DBX_ERRORS_TABLE.format(table=state.qualified_errors_table))
+        cur.execute(ddl.GRANTS_TABLE.format(table=state.qualified_grants_table))
+        cur.execute(ddl.SLA_TABLE.format(table=state.qualified_sla_table))
+        cur.execute(ddl.ERRORS_TABLE.format(table=state.qualified_errors_table))
+        cur.execute(ddl.MEMBERSHIPS_TABLE.format(table=state.qualified_memberships_table))
+        cur.execute(ddl.LEDGER_TABLE.format(table=state.qualified_ledger_table))
     logger.info(
         f"[State] Delta state tables ready: {state.qualified_grants_table}, "
-        f"{state.qualified_sla_table}, {state.qualified_errors_table}"
+        f"{state.qualified_sla_table}, {state.qualified_errors_table}, "
+        f"{state.qualified_memberships_table}, {state.qualified_ledger_table}"
     )
+
+
+def is_stage_processed(
+    conn, action_request_urn: str, stage: str, state: DatabricksStateConfig
+) -> bool:
+    """Return True if this (request, stage) has already been claimed in the ledger."""
+    sql = dml.COUNT_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(sql, {"urn": action_request_urn, "stage": stage})
+        row = cur.fetchone()
+        return bool(row and int(row[0]) > 0)
+
+
+def claim_stage(conn, action_request_urn: str, stage: str, state: DatabricksStateConfig) -> bool:
+    """Atomically claim a processing stage for a request.
+
+    Returns True if this call won the claim (the caller should now perform the
+    stage's side effect exactly once), or False if it was already claimed. The
+    claim is written *before* the side effect so a replayed event never triggers
+    a second notification.
+    """
+    if is_stage_processed(conn, action_request_urn, stage, state):
+        return False
+    sql = dml.CLAIM_LEDGER_STAGE.format(table=state.qualified_ledger_table)
+    with _cursor(conn) as cur:
+        cur.execute(
+            sql,
+            {"urn": action_request_urn, "stage": stage, "now": int(time.time() * 1000)},
+        )
+    return True
 
 
 def is_already_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
     """Return True if this request URN's grant is still active (not revoked)."""
-    # ponytail: integer result columns are CAST to STRING throughout this module
-    # because databricks-sql-connector 2.9.x converts arrow results via
-    # pandas.to_numpy(na_value=None), which raises on *any* int column under
-    # numpy 2.x (it coerces None to the int dtype before applying the null mask).
-    # Casting to STRING yields an object column that survives the conversion.
-    # Upgrade path: connector >= 3.x reads native types and makes this unnecessary.
-    sql = (
-        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_grants_table} "
-        f"WHERE latest_action_request_urn = %(urn)s AND revoked_at_ms IS NULL"
-    )
+    # COUNT is CAST to STRING in the query (see sql/databricks/dml.py for why) so
+    # we parse it back with int() here.
+    sql = dml.COUNT_ACTIVE_GRANT.format(table=state.qualified_grants_table)
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
         row = cur.fetchone()
@@ -298,30 +386,12 @@ def is_already_provisioned(conn, action_request_urn: str, state: DatabricksState
 
 def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfig) -> None:
     """Upsert a grant row, keyed on (grantee, catalog, schema, table)."""
-    schema_key = grant.schema or SCHEMA_ALL
+    schema_key = grant.schema_name or SCHEMA_ALL
     table_key = grant.table or TABLE_ALL
 
     # Inline NULL when there is no expiry so we never bind an untyped NULL param.
     expires_expr = "%(expires)s" if grant.expires_at_ms is not None else "NULL"
-    sql = f"""
-        MERGE INTO {state.qualified_grants_table} AS t
-        USING (SELECT %(grantee)s AS grantee, %(catalog)s AS dbx_catalog,
-                      %(schema)s AS dbx_schema, %(tbl)s AS dbx_table) AS s
-            ON  t.grantee     = s.grantee
-            AND t.dbx_catalog = s.dbx_catalog
-            AND t.dbx_schema  = s.dbx_schema
-            AND t.dbx_table   = s.dbx_table
-        WHEN MATCHED THEN UPDATE SET
-            latest_action_request_urn = %(urn)s,
-            requestor_email           = %(email)s,
-            granted_at_ms             = %(granted)s,
-            expires_at_ms             = {expires_expr},
-            revoked_at_ms             = NULL
-        WHEN NOT MATCHED THEN INSERT
-            (grantee, dbx_catalog, dbx_schema, dbx_table,
-             latest_action_request_urn, requestor_email, granted_at_ms, expires_at_ms, revoked_at_ms)
-            VALUES (%(grantee)s, %(catalog)s, %(schema)s, %(tbl)s, %(urn)s, %(email)s, %(granted)s, {expires_expr}, NULL)
-    """
+    sql = dml.MERGE_GRANT.format(table=state.qualified_grants_table, expires_expr=expires_expr)
     params: dict[str, Any] = {
         "grantee": grant.principal,
         "catalog": grant.catalog,
@@ -345,13 +415,7 @@ def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfi
 def get_expired_grants(conn, state: DatabricksStateConfig) -> list[DatabricksGrantRecord]:
     """Return all active grants whose expiry is in the past."""
     now_ms = int(time.time() * 1000)
-    # CAST the bigint timestamp columns to STRING — see is_already_provisioned().
-    sql = (
-        f"SELECT latest_action_request_urn, grantee, dbx_catalog, dbx_schema, dbx_table, "
-        f"requestor_email, CAST(granted_at_ms AS STRING), CAST(expires_at_ms AS STRING) "
-        f"FROM {state.qualified_grants_table} "
-        f"WHERE expires_at_ms IS NOT NULL AND expires_at_ms <= %(now)s AND revoked_at_ms IS NULL"
-    )
+    sql = dml.SELECT_EXPIRED_GRANTS.format(table=state.qualified_grants_table)
     grants: list[DatabricksGrantRecord] = []
     with _cursor(conn) as cur:
         cur.execute(sql, {"now": now_ms})
@@ -362,7 +426,7 @@ def get_expired_grants(conn, state: DatabricksStateConfig) -> list[DatabricksGra
                     action_request_urn=urn,
                     principal=grantee,
                     catalog=catalog,
-                    schema=schema_key if schema_key != SCHEMA_ALL else None,
+                    schema_name=schema_key if schema_key != SCHEMA_ALL else None,
                     table=table_key if table_key != TABLE_ALL else None,
                     requestor_email=email,
                     granted_at_ms=int(granted),
@@ -374,13 +438,9 @@ def get_expired_grants(conn, state: DatabricksStateConfig) -> list[DatabricksGra
 
 def record_revocation(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfig) -> None:
     """Mark the grant row revoked, keyed on the natural access combo."""
-    schema_key = grant.schema or SCHEMA_ALL
+    schema_key = grant.schema_name or SCHEMA_ALL
     table_key = grant.table or TABLE_ALL
-    sql = (
-        f"UPDATE {state.qualified_grants_table} SET revoked_at_ms = %(now)s "
-        f"WHERE grantee = %(grantee)s AND dbx_catalog = %(catalog)s "
-        f"AND dbx_schema = %(schema)s AND dbx_table = %(tbl)s"
-    )
+    sql = dml.UPDATE_REVOKE_GRANT.format(table=state.qualified_grants_table)
     with _cursor(conn) as cur:
         cur.execute(
             sql,
@@ -401,11 +461,7 @@ def is_sla_notified(
     conn, action_request_urn: str, notification_type: str, state: DatabricksStateConfig
 ) -> bool:
     """Return True if this SLA notification has already been sent."""
-    # CAST COUNT to STRING — see is_already_provisioned().
-    sql = (
-        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_sla_table} "
-        f"WHERE action_request_urn = %(urn)s AND notification_type = %(ntype)s"
-    )
+    sql = dml.COUNT_SLA_NOTIFIED.format(table=state.qualified_sla_table)
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn, "ntype": notification_type})
         row = cur.fetchone()
@@ -416,14 +472,7 @@ def record_sla_notification(
     conn, action_request_urn: str, notification_type: str, state: DatabricksStateConfig
 ) -> None:
     """Record a sent SLA notification (idempotent via MERGE)."""
-    sql = f"""
-        MERGE INTO {state.qualified_sla_table} AS t
-        USING (SELECT %(urn)s AS action_request_urn, %(ntype)s AS notification_type) AS s
-            ON t.action_request_urn = s.action_request_urn
-            AND t.notification_type = s.notification_type
-        WHEN NOT MATCHED THEN INSERT (action_request_urn, notification_type, sent_at_ms)
-            VALUES (%(urn)s, %(ntype)s, %(now)s)
-    """
+    sql = dml.MERGE_SLA_NOTIFICATION.format(table=state.qualified_sla_table)
     with _cursor(conn) as cur:
         cur.execute(
             sql,
@@ -434,6 +483,87 @@ def record_sla_notification(
             },
         )
     logger.debug(f"[State] Recorded SLA notification {notification_type} for {action_request_urn}")
+
+
+# ---------------------------------------------------------------------------
+# Group membership state (mirrors the grants table, keyed on user + group)
+# ---------------------------------------------------------------------------
+
+
+def is_membership_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
+    """Return True if this request URN's membership is still active (not removed)."""
+    sql = dml.COUNT_ACTIVE_MEMBERSHIP.format(table=state.qualified_memberships_table)
+    with _cursor(conn) as cur:
+        cur.execute(sql, {"urn": action_request_urn})
+        row = cur.fetchone()
+        return bool(row and int(row[0]) > 0)
+
+
+def record_membership(
+    conn, membership: DatabricksGroupMembershipRecord, state: DatabricksStateConfig
+) -> None:
+    """Upsert a membership row, keyed on (user_email, group_name)."""
+    expires_expr = "%(expires)s" if membership.expires_at_ms is not None else "NULL"
+    sql = dml.MERGE_MEMBERSHIP.format(
+        table=state.qualified_memberships_table, expires_expr=expires_expr
+    )
+    params: dict[str, Any] = {
+        "user": membership.user_email,
+        "grp": membership.group_name,
+        "urn": membership.action_request_urn,
+        "added": membership.added_at_ms,
+    }
+    if membership.expires_at_ms is not None:
+        params["expires"] = membership.expires_at_ms
+
+    with _cursor(conn) as cur:
+        cur.execute(sql, params)
+    logger.debug(
+        f"[State] Membership recorded for {membership.action_request_urn} "
+        f"({membership.user_email} -> {membership.group_name})"
+    )
+
+
+def get_expired_memberships(
+    conn, state: DatabricksStateConfig
+) -> list[DatabricksGroupMembershipRecord]:
+    """Return all active memberships whose expiry is in the past."""
+    now_ms = int(time.time() * 1000)
+    sql = dml.SELECT_EXPIRED_MEMBERSHIPS.format(table=state.qualified_memberships_table)
+    memberships: list[DatabricksGroupMembershipRecord] = []
+    with _cursor(conn) as cur:
+        cur.execute(sql, {"now": now_ms})
+        for row in cur.fetchall():
+            urn, user_email, group_name, added, expires = row
+            memberships.append(
+                DatabricksGroupMembershipRecord(
+                    action_request_urn=urn,
+                    user_email=user_email,
+                    group_name=group_name,
+                    added_at_ms=int(added),
+                    expires_at_ms=int(expires) if expires is not None else None,
+                )
+            )
+    return memberships
+
+
+def record_membership_removal(
+    conn, membership: DatabricksGroupMembershipRecord, state: DatabricksStateConfig
+) -> None:
+    """Mark the membership row removed, keyed on (user_email, group_name)."""
+    sql = dml.UPDATE_REMOVE_MEMBERSHIP.format(table=state.qualified_memberships_table)
+    with _cursor(conn) as cur:
+        cur.execute(
+            sql,
+            {
+                "now": int(time.time() * 1000),
+                "user": membership.user_email,
+                "grp": membership.group_name,
+            },
+        )
+    logger.debug(
+        f"[State] Marked {membership.user_email} -> {membership.group_name} membership removed"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -469,11 +599,7 @@ def is_permanent_databricks_error(exc: Exception) -> bool:
 
 def is_provisioning_failed(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
     """Return True if this request URN has a recorded permanent failure."""
-    # CAST COUNT to STRING — see is_already_provisioned().
-    sql = (
-        f"SELECT CAST(COUNT(*) AS STRING) FROM {state.qualified_errors_table} "
-        f"WHERE action_request_urn = %(urn)s"
-    )
+    sql = dml.COUNT_PROVISIONING_ERROR.format(table=state.qualified_errors_table)
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
         row = cur.fetchone()
@@ -488,13 +614,7 @@ def record_provisioning_error(
     state: DatabricksStateConfig,
 ) -> None:
     """Record a permanent provisioning failure so the request is not retried."""
-    sql = f"""
-        MERGE INTO {state.qualified_errors_table} AS t
-        USING (SELECT %(urn)s AS action_request_urn) AS s
-            ON t.action_request_urn = s.action_request_urn
-        WHEN NOT MATCHED THEN INSERT (action_request_urn, error_code, error_message, failed_at_ms)
-            VALUES (%(urn)s, %(code)s, %(msg)s, %(now)s)
-    """
+    sql = dml.MERGE_PROVISIONING_ERROR.format(table=state.qualified_errors_table)
     with _cursor(conn) as cur:
         cur.execute(
             sql,
