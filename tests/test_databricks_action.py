@@ -121,6 +121,34 @@ def test_provision_derives_target_from_entity_and_records(base_config_dict, mock
     action.close()
 
 
+def test_approved_non_access_workflow_is_not_provisioned(base_config_dict, mock_pipeline_context):
+    """A revocation request is raised on the same dataset and reaches COMPLETED/ACCEPTED
+    just like an access request. Without the workflow filter it would be granted."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    revocation = AccessRequest(
+        urn="urn:li:actionRequest:revoke-001",
+        status="COMPLETED",
+        result="ACCEPTED",
+        note=None,
+        request_type="WORKFLOW_FORM_REQUEST",
+        workflow_name="Access Revocation Request",
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+        requestor_urn="urn:li:corpuser:alice@example.com",
+        created_ms=int(time.time() * 1000),
+        due_date_ms=None,
+        form_fields=FormFieldValues(),
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.fetch_action_request", return_value=revocation),
+        patch(f"{_ACTION_MODULE}.dbx.provision_access") as mock_provision,
+    ):
+        action._handle_status_change(revocation.urn)
+        mock_provision.assert_not_called()
+
+    action.close()
+
+
 def test_provision_strips_platform_instance_from_resource_urn(
     base_config_dict, mock_pipeline_context
 ):
@@ -438,7 +466,7 @@ def test_denied_request_sends_denial_email(base_config_dict, mock_pipeline_conte
         requestor_urn="urn:li:corpuser:bob@example.com",
         created_ms=int(time.time() * 1000),
         due_date_ms=None,
-        form_fields=FormFieldValues(),
+        form_fields=FormFieldValues(access_duration_days=30),
     )
 
     with (

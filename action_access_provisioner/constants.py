@@ -22,6 +22,7 @@ query fetchActionRequest($urn: String!) {
     dueDate
     params {
       workflowFormRequest {
+        workflow { urn name }
         fields {
           id
           values {
@@ -53,6 +54,7 @@ query listActionRequests($input: ListActionRequestsInput!) {
       dueDate
       params {
         workflowFormRequest {
+          workflow { urn name }
           fields {
             id
             values {

@@ -107,7 +107,7 @@ def test_record_membership_merges_on_user_and_group(mock_conn, state_config):
         expires_at_ms=int(time.time() * 1000) + 14 * 86_400_000,
     )
     record_membership(conn, membership, state_config)
-    sql = cursor.execute.call_args[0][0]
+    sql = cursor.execute.call_args_list[0][0][0]
     assert "MERGE INTO" in sql
     assert "user_email" in sql and "group_name" in sql
 
@@ -127,7 +127,8 @@ def test_get_expired_memberships_parses_rows(mock_conn, state_config):
 
 def test_is_membership_provisioned_uses_urn_and_removed_guard(mock_conn, state_config):
     conn, cursor = mock_conn
-    cursor.fetchone.return_value = ("1",)
+    # First fetchone answers the ledger probe (miss), second the memberships table.
+    cursor.fetchone.side_effect = [("0",), ("1",)]
     assert is_membership_provisioned(conn, "urn:li:actionRequest:m1", state_config) is True
     sql = cursor.execute.call_args[0][0]
     assert "latest_action_request_urn" in sql
@@ -137,21 +138,48 @@ def test_is_membership_provisioned_uses_urn_and_removed_guard(mock_conn, state_c
 def test_is_already_provisioned_uses_urn_and_revoked_guard(mock_conn, state_config):
     conn, cursor = mock_conn
     # The connector returns the CAST(COUNT(*) AS STRING) value as a string.
-    cursor.fetchone.return_value = ("1",)
+    # First fetchone answers the ledger probe (miss), second the grants table.
+    cursor.fetchone.side_effect = [("0",), ("1",)]
     assert is_already_provisioned(conn, "urn:li:actionRequest:001", state_config) is True
     sql = cursor.execute.call_args[0][0]
     assert "latest_action_request_urn" in sql
     assert "revoked_at_ms IS NULL" in sql
 
 
+def test_is_already_provisioned_short_circuits_on_ledger(mock_conn, state_config):
+    # A superseded request is invisible to the grants table, whose
+    # latest_action_request_urn now names a newer request for the same target.
+    # The ledger must answer on its own or the grant is re-executed every pass.
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("1",)
+    assert is_already_provisioned(conn, "urn:li:actionRequest:001", state_config) is True
+    assert cursor.execute.call_count == 1
+    assert "access_provisioner_ledger" in cursor.execute.call_args[0][0]
+
+
 def test_record_grant_merges_on_natural_key(mock_conn, state_config, grant_with_expiry):
     conn, cursor = mock_conn
     record_grant(conn, grant_with_expiry, state_config)
-    sql, params = cursor.execute.call_args[0]
+    sql, params = cursor.execute.call_args_list[0][0]
     assert "MERGE INTO" in sql
     for col in ("grantee", "dbx_catalog", "dbx_schema", "dbx_table"):
         assert col in sql
     assert params["expires"] == grant_with_expiry.expires_at_ms
+
+
+def test_record_grant_stamps_the_request_ledger(mock_conn, state_config, grant_with_expiry):
+    # Without this stamp, idempotency falls back to the grants table's
+    # latest_action_request_urn, which cannot recognise a superseded request.
+    conn, cursor = mock_conn
+    cursor.fetchone.return_value = ("0",)
+    record_grant(conn, grant_with_expiry, state_config)
+    ledger_calls = [
+        c for c in cursor.execute.call_args_list if "access_provisioner_ledger" in c[0][0]
+    ]
+    assert any(
+        c[0][1]["stage"] == "provisioned" and c[0][1]["urn"] == grant_with_expiry.action_request_urn
+        for c in ledger_calls
+    )
 
 
 def test_record_grant_no_expiry_inlines_null_and_omits_param(mock_conn, state_config):
@@ -167,7 +195,7 @@ def test_record_grant_no_expiry_inlines_null_and_omits_param(mock_conn, state_co
         expires_at_ms=None,
     )
     record_grant(conn, grant, state_config)
-    sql, params = cursor.execute.call_args[0]
+    sql, params = cursor.execute.call_args_list[0][0]
     assert "expires" not in params  # inlined as NULL, not bound
     # None schema/table stored as sentinels so the natural key has no NULLs.
     assert params["schema"] == SCHEMA_ALL

@@ -1,7 +1,10 @@
 from enum import Enum
 from typing import Any, Literal
 
+from datahub.configuration.common import AllowDenyPattern
 from pydantic import BaseModel, Field, model_validator
+
+from action_access_provisioner.models import AccessRequest
 
 # Snowflake application tag (shows up in QUERY_HISTORY, mirrors the ingestion connector).
 _SNOWFLAKE_APPLICATION_NAME = "acryl_datahub_access_provisioner"
@@ -392,6 +395,54 @@ class ReconcileConfig(BaseModel):
     )
 
 
+class WorkflowFilterConfig(BaseModel):
+    """Selects which approved workflow requests this action acts on.
+
+    A DataHub deployment normally runs many workflows — deprecation, ownership
+    change, classification, revocation — and only some of them grant access.
+    Every one of those can be raised against a grantable entity, so without a
+    filter the provisioner would treat an approved *revocation* request as a
+    grant. Both checks below must pass before a request is provisioned.
+    """
+
+    workflow: AllowDenyPattern = Field(
+        default_factory=AllowDenyPattern.allow_all,
+        description=(
+            "Allow/deny regexes matched against the workflow's name and URN, in the same "
+            "style as an ingestion connector's filters. A request is provisioned only when "
+            "neither identifier is denied and at least one is allowed."
+        ),
+    )
+    require_access_fields: bool = Field(
+        default=True,
+        description=(
+            "Also require the request's form to carry at least one field that only an "
+            "access request would set (duration, target role/database, or group). This "
+            "keeps non-access workflows out even when no allow/deny pattern is configured. "
+            "Set to false if your access workflow asks for none of those — e.g. it grants "
+            "permanent, individually-scoped access with no duration prompt."
+        ),
+    )
+
+    def permits_workflow(self, name: str | None, urn: str | None) -> bool:
+        identifiers = [i for i in (name, urn) if i]
+        if not identifiers:
+            # Older GMS builds don't return the workflow on the request. Allow it
+            # through only while the pattern is still the permissive default, so an
+            # explicit allowlist is never silently bypassed.
+            return not self.workflow.deny and self.workflow.allow == [".*"]
+        # Deny wins over allow, and is checked across both identifiers so a denied
+        # name cannot be readmitted by matching on the URN.
+        if any(self.workflow.denied(i) for i in identifiers):
+            return False
+        return any(self.workflow.allowed(i) for i in identifiers)
+
+    def permits(self, request: AccessRequest) -> bool:
+        if not self.permits_workflow(request.workflow_name, request.workflow_urn):
+            return False
+        return not self.require_access_fields or request.has_access_fields
+
+
 class SnowflakeProvisioningConfig(BaseModel):
     """Controls how Snowflake GRANT statements are constructed."""
 
@@ -459,6 +510,10 @@ class AccessProvisionerConfig(BaseModel):
     provisioning: SnowflakeProvisioningConfig = Field(
         default_factory=SnowflakeProvisioningConfig,
         description="Options controlling how Snowflake grants are executed",
+    )
+    workflow_filter: WorkflowFilterConfig = Field(
+        default_factory=WorkflowFilterConfig,
+        description="Which approved workflow requests this action provisions",
     )
 
     # Form field IDs — these must match the field IDs defined in the DataHub workflow form
@@ -851,6 +906,15 @@ class DatahubSyncConfig(BaseModel):
         default="databricks",
         description="Data platform used when building dataset URNs for access associations",
     )
+    platform_instance: str | None = Field(
+        default=None,
+        description=(
+            "Platform instance the datasets were ingested under. Unity Catalog ingestion "
+            "prepends it to the dataset name (<instance>.<catalog>.<schema>.<table>), so it "
+            "must be set to the same value here or the mirror will attach access to a "
+            "non-existent dataset URN."
+        ),
+    )
     env: str = Field(
         default="PROD",
         description="Fabric/env used when building dataset URNs (must match how datasets were ingested)",
@@ -897,6 +961,10 @@ class DatabricksAccessProvisionerConfig(BaseModel):
     provisioning: DatabricksProvisioningConfig = Field(
         default_factory=DatabricksProvisioningConfig,
         description="Options controlling how Databricks grants are executed",
+    )
+    workflow_filter: WorkflowFilterConfig = Field(
+        default_factory=WorkflowFilterConfig,
+        description="Which approved workflow requests this action provisions",
     )
     identity: DatabricksIdentityConfig = Field(
         default_factory=DatabricksIdentityConfig,

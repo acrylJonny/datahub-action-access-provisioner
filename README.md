@@ -120,7 +120,7 @@ When creating the ingestion source in the DataHub Cloud UI, go to **Step 5 → A
 and add the following under **Extra Pip Libraries**:
 
 ```json
-["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.20/datahub_action_access_provisioner-0.1.20-py3-none-any.whl"]
+["/datahub-integrations-service", "https://github.com/acrylJonny/datahub-action-access-provisioner/releases/download/v0.1.21/datahub_action_access_provisioner-0.1.21-py3-none-any.whl"]
 ```
 
 Update the wheel URL to point to the [latest release](https://github.com/acrylJonny/datahub-action-access-provisioner/releases)
@@ -175,6 +175,41 @@ override via `field_*` config keys if needed):
 
 See [`examples/example_workflow_form_fields.md`](examples/example_workflow_form_fields.md)
 for the exact SQL that will be executed for different combinations.
+
+### Choosing which workflows grant access
+
+A DataHub deployment normally runs many workflows — deprecation, ownership change,
+classification, revocation. All of them can be raised against the same entities and
+all of them reach `COMPLETED` / `ACCEPTED` in exactly the same way, so the
+provisioner needs to be told which ones actually mean "grant access". Otherwise
+approving a *revocation* request results in a grant.
+
+Two independent checks are applied, and both must pass:
+
+1. **Content** (`require_access_fields`, on by default). The request's form must
+   carry at least one field that only an access request would set — a duration, a
+   target group, or a Snowflake role/database. This excludes metadata and
+   revocation workflows without any configuration. Set it to `false` if your access
+   workflow asks for none of those (e.g. permanent access with no duration prompt).
+2. **Name / URN pattern** (`workflow`), using the same allow/deny semantics as an
+   ingestion connector's filters. It is matched against both the workflow's display
+   name and its URN: a request is admitted only when neither identifier is denied
+   and at least one is allowed. Defaults to allow-all.
+
+```yaml
+workflow_filter:
+  workflow:
+    allow:
+      - "Dataset Access Request"
+      - "Data Product Access Request"
+    deny:
+      - ".*Revocation.*"
+  require_access_fields: true
+```
+
+Naming your access workflows explicitly is recommended for any deployment that runs
+more than a couple of workflows — the content check is a safety net, not a
+substitute for saying what you mean.
 
 ## Running Locally
 
@@ -280,6 +315,16 @@ on `(ACTION_REQUEST_URN, STAGE)`. Each stage is _claimed_ (an insert-if-absent)
 **before** its notification is sent, so a duplicate live event, a replay after a
 restart, or a reconciliation pass overlapping a live event never sends a second
 email. `claim_stage()` returns `True` only to the caller that won the claim.
+
+The ledger is also what makes **provisioning** idempotent per request. The grants
+table cannot answer "has this request been provisioned?" on its own: it holds one
+row per access combination, and its `LATEST_ACTION_REQUEST_URN` column is
+overwritten whenever a newer request targets the same object. Every superseded
+request would then look unprovisioned and be re-granted on every reconciliation
+pass, forever. A `provisioned` stage is therefore stamped on the request itself
+once the grant is recorded, and that stage — not the grants table — is the
+authority. The grants-table check is retained only so rows written before the
+ledger existed are not re-provisioned once.
 
 ### Delivery guarantees, reconciliation, and delay
 
@@ -431,8 +476,16 @@ datahub_sync:
   role_urn_prefix: databricks # role URNs: urn:li:role:databricks.<group>
   platform: databricks
   env: PROD # must match how the datasets were ingested
+  platform_instance: my_workspace # must match how the datasets were ingested
   request_url: https://your-datahub/... # optional, surfaced on the role
 ```
+
+`env` and `platform_instance` must match the values your Unity Catalog ingestion
+used. The mirror rebuilds the dataset URN from `catalog.schema.table`, and the
+`platform_instance` is not recoverable from those (it is deliberately stripped when
+resolving the grant target — see below). Get it wrong and the mirror silently
+attaches the `access` aspect to a dataset URN no ingestion ever produced, leaving
+your real dataset unlinked.
 
 What gets written:
 

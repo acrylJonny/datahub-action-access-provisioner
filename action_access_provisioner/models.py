@@ -13,6 +13,7 @@ ACTION_REQUEST_TYPE_WORKFLOW = "WORKFLOW_FORM_REQUEST"
 
 # Processing-ledger stages — each is claimed exactly once per request URN so that
 # a replayed or duplicate event never repeats the associated one-shot side effect.
+LEDGER_STAGE_PROVISIONED = "provisioned"
 LEDGER_STAGE_APPROVAL_NOTIFIED = "approval_notified"
 LEDGER_STAGE_DENIAL_NOTIFIED = "denial_notified"
 LEDGER_STAGE_REVOCATION_NOTIFIED = "revocation_notified"
@@ -64,6 +65,11 @@ class AccessRequest(BaseModel):
 
     # From actionRequestInfo
     request_type: str
+    # Which workflow definition raised this request. A deployment typically runs
+    # many workflows, most of which are not access requests, so the provisioner
+    # must be able to tell them apart before acting (see WorkflowFilterConfig).
+    workflow_urn: str | None = None
+    workflow_name: str | None = None
     resource: str | None
     requestor_urn: str | None
     created_ms: int | None
@@ -83,6 +89,24 @@ class AccessRequest(BaseModel):
     @property
     def is_pending(self) -> bool:
         return self.status == REQUEST_STATUS_PENDING
+
+    @property
+    def has_access_fields(self) -> bool:
+        """True when the form carries a field only an access request would set.
+
+        Used as a content-based guard so that a metadata or revocation workflow
+        raised on the same dataset is never mistaken for an access request.
+        """
+        f = self.form_fields
+        return any(
+            v is not None
+            for v in (
+                f.access_duration_days,
+                f.databricks_group,
+                f.snowflake_role,
+                f.snowflake_database,
+            )
+        )
 
 
 class GrantRecord(BaseModel):

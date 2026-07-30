@@ -92,7 +92,15 @@ class GqlAccessWorkflowRequest(BaseModel):
     expiresAt: int | None = None
 
 
+class GqlWorkflow(BaseModel):
+    """The workflow definition a form request was raised against."""
+
+    urn: str | None = None
+    name: str | None = None
+
+
 class GqlWorkflowFormRequest(BaseModel):
+    workflow: GqlWorkflow | None = None
     fields: list[GqlFormField] = Field(default_factory=list)
     access: GqlAccessWorkflowRequest | None = None
 
@@ -164,14 +172,21 @@ class GqlActionRequest(BaseModel):
             return wf.to_form_field_values(config_field_ids)
         return FormFieldValues()
 
+    def _workflow(self) -> GqlWorkflow | None:
+        wf = self.params.workflowFormRequest if self.params else None
+        return wf.workflow if wf else None
+
     def to_access_request(self, config_field_ids: dict[str, str]) -> AccessRequest:
         """Convert to the domain AccessRequest dataclass."""
+        workflow = self._workflow()
         return AccessRequest(
             urn=self.urn,
             status=self.status,
             result=self.result,
             note=self.resultNote,
             request_type=self.type,
+            workflow_urn=workflow.urn if workflow else None,
+            workflow_name=workflow.name if workflow else None,
             resource=self.entity.urn if self.entity else None,
             requestor_urn=self.created.actor.urn if self.created.actor else None,
             created_ms=self.created.time,

@@ -174,6 +174,12 @@ class DatabricksAccessProvisionerAction(Action):
         conn = self._get_sql_conn()
         new_count = 0
         for request in approved:
+            if not self.config.workflow_filter.permits(request):
+                logger.debug(
+                    f"[Catchup] {request.urn} raised by workflow "
+                    f"{request.workflow_name!r} is not an access request — skipping"
+                )
+                continue
             if self._already_provisioned(conn, request.urn):
                 logger.debug(f"[Catchup] {request.urn} already provisioned — skipping")
                 continue
@@ -298,6 +304,15 @@ class DatabricksAccessProvisionerAction(Action):
             logger.warning(f"[Live] Could not fetch request {action_request_urn}")
             return
         if request.request_type != ACTION_REQUEST_TYPE_WORKFLOW:
+            return
+        # Most workflows in a deployment are not access requests, and they are raised
+        # on the same datasets. Acting on them would grant access on approval of, say,
+        # a deprecation or revocation request.
+        if not self.config.workflow_filter.permits(request):
+            logger.debug(
+                f"[Live] {action_request_urn} raised by workflow "
+                f"{request.workflow_name!r} is not an access request — ignoring"
+            )
             return
 
         if request.is_approved:

@@ -22,7 +22,7 @@ import logging
 from typing import Protocol, TypeVar, runtime_checkable
 
 from datahub.emitter.mce_builder import (
-    make_dataset_urn,
+    make_dataset_urn_with_platform_instance,
     make_group_urn,
     make_user_urn,
 )
@@ -95,10 +95,14 @@ class DatahubSync:
 
     def _dataset_urn(self, catalog: str, schema: str, table: str) -> str:
         # catalog/schema/table come straight off the dataset URN the request was raised
-        # on, so they already match DataHub's stored (lowercased) identifiers.
-        return make_dataset_urn(
+        # on, so they already match DataHub's stored (lowercased) identifiers. The
+        # platform_instance is *not* recoverable from them — parse_databricks_dataset_urn
+        # deliberately drops it — so it has to be re-applied from config, otherwise the
+        # association lands on a URN no ingestion ever produced.
+        return make_dataset_urn_with_platform_instance(
             platform=self.config.platform,
             name=f"{catalog}.{schema}.{table}",
+            platform_instance=self.config.platform_instance,
             env=self.config.env,
         )
 

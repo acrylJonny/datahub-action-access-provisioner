@@ -162,6 +162,28 @@ source:
           dry_run: false                     # Set true to test without executing
 
         # ----------------------------------------------------------------
+        # Which approved workflow requests to act on.
+        #
+        # Every workflow in your deployment — deprecation, ownership change,
+        # revocation — can be raised against the same entities and reaches
+        # COMPLETED/ACCEPTED in exactly the same way. Without a filter, approving
+        # a revocation request would grant access.
+        #
+        # By default the provisioner acts only on requests whose form carries a
+        # field only an access request would set (target role/database, duration,
+        # or group). Add an allow/deny pattern — same semantics as an ingestion
+        # connector's filters — to name your access workflows explicitly. It is
+        # matched against both the workflow's display name and its URN.
+        # ----------------------------------------------------------------
+        # workflow_filter:
+        #   workflow:
+        #     allow:
+        #       - "Dataset Access Request"
+        #     deny:
+        #       - ".*Revocation.*"
+        #   require_access_fields: true
+
+        # ----------------------------------------------------------------
         # Catchup window — how far back to scan DataHub for approved requests
         # on each startup pass. Requests outside this window are assumed
         # already handled. 90 days is a safe default.

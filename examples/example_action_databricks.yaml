@@ -164,7 +164,34 @@ source:
         #   role_urn_prefix: "databricks"   # role URNs: urn:li:role:databricks.<group>
         #   platform: "databricks"
         #   env: "PROD"                # must match how the datasets were ingested
+        #   # Must match the platform_instance the datasets were ingested under, or the
+        #   # mirror attaches access to a dataset URN that does not exist.
+        #   platform_instance: "my_workspace"
         #   # request_url: "https://your-datahub/..."  # optional link on the role
+
+        # ----------------------------------------------------------------
+        # Which approved workflow requests to act on.
+        #
+        # Every workflow in your deployment — deprecation, ownership change,
+        # revocation — can be raised against the same datasets and reaches
+        # COMPLETED/ACCEPTED in exactly the same way. Without a filter, approving
+        # a revocation request would grant access.
+        #
+        # By default the provisioner acts only on requests whose form carries a
+        # field only an access request would set (duration, group, or a Snowflake
+        # role/database), which excludes metadata and revocation workflows with no
+        # configuration. Add an allow/deny pattern — same semantics as an ingestion
+        # connector's filters — to name your access workflows explicitly. It is
+        # matched against both the workflow's display name and its URN.
+        # ----------------------------------------------------------------
+        # workflow_filter:
+        #   workflow:
+        #     allow:
+        #       - "Dataset Access Request"
+        #       - "Data Product Access Request"
+        #     deny:
+        #       - ".*Revocation.*"
+        #   require_access_fields: true   # set false if your access form has none of those fields
 
         # ----------------------------------------------------------------
         # Catchup window — how far back to scan DataHub for approved requests

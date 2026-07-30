@@ -10,6 +10,7 @@ from action_access_provisioner.config import (
     DatabricksStateConfig,
 )
 from action_access_provisioner.models import (
+    LEDGER_STAGE_PROVISIONED,
     DatabricksGrantRecord,
     DatabricksGroupMembershipRecord,
 )
@@ -374,7 +375,18 @@ def claim_stage(conn, action_request_urn: str, stage: str, state: DatabricksStat
 
 
 def is_already_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
-    """Return True if this request URN's grant is still active (not revoked)."""
+    """Return True if this request has already been provisioned.
+
+    The ledger is authoritative because it holds one row per request URN. The
+    grants table cannot answer this on its own: it holds one row per
+    (grantee, catalog, schema, table) and its ``latest_action_request_urn``
+    column is overwritten whenever a newer request targets the same object, so
+    every superseded request would look unprovisioned and be granted again on
+    each pass. The grants-table check is retained only so that rows written
+    before the ledger existed are not re-provisioned.
+    """
+    if is_stage_processed(conn, action_request_urn, LEDGER_STAGE_PROVISIONED, state):
+        return True
     # COUNT is CAST to STRING in the query (see sql/databricks/dml.py for why) so
     # we parse it back with int() here.
     sql = dml.COUNT_ACTIVE_GRANT.format(table=state.qualified_grants_table)
@@ -385,7 +397,11 @@ def is_already_provisioned(conn, action_request_urn: str, state: DatabricksState
 
 
 def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfig) -> None:
-    """Upsert a grant row, keyed on (grantee, catalog, schema, table)."""
+    """Upsert a grant row, keyed on (grantee, catalog, schema, table).
+
+    Also stamps the request's ledger entry, which is what makes provisioning
+    idempotent per request rather than per target.
+    """
     schema_key = grant.schema_name or SCHEMA_ALL
     table_key = grant.table or TABLE_ALL
 
@@ -406,6 +422,9 @@ def record_grant(conn, grant: DatabricksGrantRecord, state: DatabricksStateConfi
 
     with _cursor(conn) as cur:
         cur.execute(sql, params)
+    # Written after the grant row so a failure above leaves the request unclaimed
+    # and the next pass retries it.
+    claim_stage(conn, grant.action_request_urn, LEDGER_STAGE_PROVISIONED, state)
     logger.debug(
         f"[State] Grant recorded for {grant.action_request_urn} "
         f"({grant.principal}/{grant.catalog}/{schema_key}/{table_key})"
@@ -491,7 +510,14 @@ def record_sla_notification(
 
 
 def is_membership_provisioned(conn, action_request_urn: str, state: DatabricksStateConfig) -> bool:
-    """Return True if this request URN's membership is still active (not removed)."""
+    """Return True if this request's membership has already been provisioned.
+
+    Same reasoning as ``is_already_provisioned``: the memberships table is keyed
+    on (user_email, group_name), so its ``latest_action_request_urn`` cannot
+    identify a superseded request. The ledger is the per-request authority.
+    """
+    if is_stage_processed(conn, action_request_urn, LEDGER_STAGE_PROVISIONED, state):
+        return True
     sql = dml.COUNT_ACTIVE_MEMBERSHIP.format(table=state.qualified_memberships_table)
     with _cursor(conn) as cur:
         cur.execute(sql, {"urn": action_request_urn})
@@ -502,7 +528,11 @@ def is_membership_provisioned(conn, action_request_urn: str, state: DatabricksSt
 def record_membership(
     conn, membership: DatabricksGroupMembershipRecord, state: DatabricksStateConfig
 ) -> None:
-    """Upsert a membership row, keyed on (user_email, group_name)."""
+    """Upsert a membership row, keyed on (user_email, group_name).
+
+    Also stamps the request's ledger entry so idempotency is per request rather
+    than per (user, group).
+    """
     expires_expr = "%(expires)s" if membership.expires_at_ms is not None else "NULL"
     sql = dml.MERGE_MEMBERSHIP.format(
         table=state.qualified_memberships_table, expires_expr=expires_expr
@@ -518,6 +548,7 @@ def record_membership(
 
     with _cursor(conn) as cur:
         cur.execute(sql, params)
+    claim_stage(conn, membership.action_request_urn, LEDGER_STAGE_PROVISIONED, state)
     logger.debug(
         f"[State] Membership recorded for {membership.action_request_urn} "
         f"({membership.user_email} -> {membership.group_name})"

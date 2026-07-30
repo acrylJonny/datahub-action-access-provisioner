@@ -56,7 +56,7 @@ def test_group_grant_mints_role_actors_and_dataset_access():
 
     access = _emitted(graph, AccessClass)[-1]
     assert [r.urn for r in access.roles] == [_ROLE_URN]
-    # the dataset URN must match how datasets are ingested (lowercased, no platform_instance)
+    # the dataset URN must match how datasets are ingested
     assert graph.emitted[-1].entityUrn == _DATASET_URN
 
 
@@ -141,3 +141,19 @@ def test_user_revoke_removes_association_without_deleting_role():
     access = _emitted(graph, AccessClass)[-1]
     assert access.roles == []
     assert _emitted(graph, RolePropertiesClass) == []
+
+
+def test_dataset_urn_includes_platform_instance_when_configured():
+    """Unity Catalog ingestion prepends the platform_instance to the dataset name, but
+    the catalog/schema/table parsed off a request URN deliberately drops it. Without
+    re-applying it the mirror attaches access to a dataset that does not exist."""
+    graph = FakeGraph()
+    sync = DatahubSync(
+        graph, DatahubSyncConfig(enabled=True, platform_instance="access_management_demo")
+    )
+    sync.on_user_grant("alice@example.com", "order_entry_db", "order_entry", "orders")
+
+    assert graph.emitted[-1].entityUrn == (
+        "urn:li:dataset:(urn:li:dataPlatform:databricks,"
+        "access_management_demo.order_entry_db.order_entry.orders,PROD)"
+    )
