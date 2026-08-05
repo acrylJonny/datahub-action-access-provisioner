@@ -133,6 +133,7 @@ class GqlWorkflowFormRequest(BaseModel):
             databricks_group=_get("field_databricks_group"),
             access_duration_days=duration_int,
             requestor_email=_get("field_requestor_email"),
+            requested_for=_get("field_requested_for"),
             justification=_get("field_justification"),
             raw=raw,
         )

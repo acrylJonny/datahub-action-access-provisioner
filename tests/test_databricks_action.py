@@ -1,4 +1,5 @@
 import time
+from types import SimpleNamespace
 from unittest.mock import MagicMock, Mock, patch
 
 import pytest
@@ -595,5 +596,111 @@ def test_provision_approval_email_deduped_when_stage_claimed(
     ):
         action._provision(request)
         mock_send.assert_not_called()
+
+    action.close()
+
+
+def _corpgroup_graph(display_name):
+    """A graph whose corpGroup profile resolves to display_name."""
+    graph = MagicMock()
+    graph.get_aspect.return_value = SimpleNamespace(displayName=display_name)
+    return graph
+
+
+def test_group_urn_from_form_picker_resolves_to_databricks_group_name(
+    base_config_dict, mock_pipeline_context
+):
+    """A DataHub group picker yields a corpGroup URN, which Unity Catalog would not
+    recognise as a principal; it must be resolved to the group's name first."""
+    mock_pipeline_context.graph = _corpgroup_graph("analytics_team")
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = _make_request(
+        FormFieldValues(access_duration_days=7, databricks_group="urn:li:corpGroup:analytics-team"),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.provision_access", return_value=[]) as mock_provision,
+        patch(f"{_ACTION_MODULE}.dbx.record_grant") as mock_record,
+        patch(f"{_ACTION_MODULE}.send_dbx_approval_notification"),
+    ):
+        action._provision(request)
+
+        assert mock_provision.call_args.kwargs["principal"] == "analytics_team"
+        assert mock_record.call_args[0][1].principal == "analytics_team"
+
+    action.close()
+
+
+def test_requested_for_receives_the_grant_and_requestor_is_notified(
+    base_config_dict, mock_pipeline_context
+):
+    """A delegated request grants to the named beneficiary, not to whoever raised it,
+    while notifications still go to the requestor."""
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = _make_request(
+        FormFieldValues(access_duration_days=7, requested_for="svc-etl@example.com"),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.provision_access", return_value=[]) as mock_provision,
+        patch(f"{_ACTION_MODULE}.dbx.record_grant") as mock_record,
+        patch(f"{_ACTION_MODULE}.send_dbx_approval_notification") as mock_notify,
+    ):
+        action._provision(request)
+
+        assert mock_provision.call_args.kwargs["principal"] == "svc-etl@example.com"
+        assert mock_record.call_args[0][1].requestor_email == "alice@example.com"
+        assert mock_notify.call_args.kwargs["recipient"] == "alice@example.com"
+
+    action.close()
+
+
+def test_requested_for_as_corpuser_urn_resolves_via_identity(
+    base_config_dict, mock_pipeline_context
+):
+    action = _create_action(base_config_dict, mock_pipeline_context)
+    request = _make_request(
+        FormFieldValues(access_duration_days=7, requested_for="urn:li:corpuser:bob@example.com"),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.provision_access", return_value=[]) as mock_provision,
+        patch(f"{_ACTION_MODULE}.dbx.record_grant"),
+        patch(f"{_ACTION_MODULE}.send_dbx_approval_notification"),
+    ):
+        action._provision(request)
+        assert mock_provision.call_args.kwargs["principal"] == "bob@example.com"
+
+    action.close()
+
+
+def test_membership_adds_the_beneficiary_not_the_requestor(base_config_dict, mock_pipeline_context):
+    """Delegated request in membership mode: the beneficiary joins the group, and the
+    requestor is told about it."""
+    action = _create_action(_membership_config(base_config_dict), mock_pipeline_context)
+    action._workspace_client = MagicMock()
+    request = _make_request(
+        FormFieldValues(
+            access_duration_days=14,
+            databricks_group="analytics_team",
+            requested_for="svc-etl@example.com",
+        ),
+        resource="urn:li:dataset:(urn:li:dataPlatform:databricks,prod.sales.orders,PROD)",
+    )
+
+    with (
+        patch(f"{_ACTION_MODULE}.dbx.add_group_member") as mock_add,
+        patch(f"{_ACTION_MODULE}.dbx.record_membership") as mock_record,
+        patch(f"{_ACTION_MODULE}.send_dbx_membership_notification") as mock_notify,
+    ):
+        action._provision(request)
+
+        assert mock_add.call_args.args[2] == "svc-etl@example.com"
+        assert mock_record.call_args[0][1].user_email == "svc-etl@example.com"
+        assert mock_notify.call_args.kwargs["member"] == "svc-etl@example.com"
+        assert mock_notify.call_args.kwargs["recipient"] == "alice@example.com"
 
     action.close()

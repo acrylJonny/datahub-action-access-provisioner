@@ -397,7 +397,8 @@ tracking, expiry/auto-revocation, and email plumbing — only the grant target a
 the state store differ.
 
 See [`examples/example_action_databricks.yaml`](examples/example_action_databricks.yaml)
-for a fully-annotated config.
+for a fully-annotated config, and [`docs/runbook.md`](docs/runbook.md) for deploying,
+verifying and operating it (including known issues).
 
 ### Install
 
@@ -447,6 +448,35 @@ field is empty the action always falls back to the individual requestor.
 
 Notifications (approval, failure, expiry) always go to the human who raised the
 request, never to the group.
+
+**Group pickers return a URN.** A DataHub group form field yields a corpGroup URN
+(`urn:li:corpGroup:analytics-team`), which Unity Catalog would not recognise as a
+principal. The action resolves it before use: an explicit
+`identity.group_overrides` entry wins, then the group's `displayName` from its
+DataHub profile, then the id from the URN. Values that are not corpGroup URNs are
+passed through untouched, so forms that already collect the Databricks group name
+are unaffected. Set `identity.resolve_group_name_from_datahub: false` to skip the
+profile lookup.
+
+### Requesting on behalf of someone else
+
+By default the grant goes to whoever raised the request. Set `field_requested_for`
+to the ID of a form field naming who the access is actually for, and the action
+grants to them instead. The field accepts a corpuser URN (resolved through the same
+identity rules as a requestor) or a bare email, which is taken at face value —
+service accounts often have no DataHub corpuser to resolve against.
+
+This covers two cases that are otherwise impossible: a manager or platform owner
+requesting for a colleague, and access for a service account, which cannot raise a
+request itself.
+
+Precedence is group, then beneficiary, then requestor. If the named beneficiary
+cannot be resolved, the action logs a warning and falls back to the requestor rather
+than failing the request.
+
+Notifications still go to the requestor, since they own the request. In membership
+mode the beneficiary is the member added to the group, and the notification tells
+the requestor who was added.
 
 ### Ticketing (Jira / ServiceNow)
 
@@ -539,7 +569,8 @@ an individual grant). The requestor's corpuser id is used directly when it is
 already an email; otherwise the email is read from the requestor's DataHub profile.
 Use `identity.principal_overrides` to map users whose DataHub id is neither (common
 with SSO), and `identity.resolve_email_from_datahub: false` to disable the profile
-lookup.
+lookup. Groups resolve the same way via `identity.group_overrides` — see
+[Group-based access](#group-based-access).
 
 `grant_method` selects how grants are applied:
 

@@ -151,6 +151,12 @@ source:
         #   principal_overrides:
         #     "urn:li:corpuser:jsmith": "jane.smith@corp.com"
         #     "bkumar": "bharat.kumar@corp.com"
+        #   # Same idea for groups, when the DataHub group name and the Databricks
+        #   # group name differ. Without an override the display name is read from
+        #   # the DataHub profile, falling back to the id in the corpGroup URN.
+        #   resolve_group_name_from_datahub: true
+        #   group_overrides:
+        #     "urn:li:corpGroup:analytics-team": "uc_analytics"
 
         # ----------------------------------------------------------------
         # Optional: mirror granted access back into DataHub as role/actors/access
@@ -208,8 +214,13 @@ source:
         field_justification: "justification"
         # Optional: a form field holding a Databricks group to grant to instead of
         # the individual requestor (group-based access). Leave the form field empty
-        # to grant to the requestor's own identity.
+        # to grant to the requestor's own identity. A DataHub group picker supplies a
+        # corpGroup URN, which is resolved to the group name (see identity below).
         # field_databricks_group: "databricks_group"
+        # Optional: a form field naming who the access is for, when that is not the
+        # person raising the request — delegated requests, and service accounts that
+        # cannot raise their own. Accepts a corpuser URN or a bare email.
+        # field_requested_for: "requested_for"
 
 datahub:
   server: "https://your-datahub-instance.acryl.io/gms"

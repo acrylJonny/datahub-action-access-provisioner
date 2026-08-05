@@ -877,6 +877,21 @@ class DatabricksIdentityConfig(BaseModel):
             "from their DataHub corpuser profile (corpUserInfo / editableInfo)."
         ),
     )
+    group_overrides: dict[str, str] = Field(
+        default_factory=dict,
+        description=(
+            "Explicit map from a DataHub corpGroup (full URN or bare id) to a Databricks "
+            "group name. Checked first, before any automatic resolution."
+        ),
+    )
+    resolve_group_name_from_datahub: bool = Field(
+        default=True,
+        description=(
+            "When a request supplies a corpGroup URN (as a DataHub group picker does), "
+            "look the group's display name up from its DataHub profile. Falls back to "
+            "the group id from the URN. Values that are not corpGroup URNs are used as-is."
+        ),
+    )
 
 
 class DatahubSyncConfig(BaseModel):
@@ -999,8 +1014,20 @@ class DatabricksAccessProvisionerConfig(BaseModel):
     field_databricks_group: str = Field(
         default="databricks_group",
         description=(
-            "Workflow form field ID that holds an optional Databricks group name. When the "
-            "form supplies a value, access is granted to that group (group-based access) "
-            "rather than to the requestor's individual identity."
+            "Workflow form field ID that holds an optional Databricks group. When the form "
+            "supplies a value, access is granted to that group (group-based access) rather "
+            "than to the requestor's individual identity. A corpGroup URN (what a DataHub "
+            "group picker produces) is resolved to a Databricks group name; see "
+            "identity.group_overrides."
+        ),
+    )
+    field_requested_for: str = Field(
+        default="requested_for",
+        description=(
+            "Workflow form field ID naming who the access is for, when that is not the "
+            "person raising the request. Accepts a corpuser URN or a bare email. Lets a "
+            "manager or platform owner request on behalf of someone else, or on behalf of "
+            "a service account that cannot raise its own request. A requested group still "
+            "takes precedence over this."
         ),
     )

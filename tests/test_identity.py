@@ -1,7 +1,14 @@
-from datahub.metadata.schema_classes import CorpUserEditableInfoClass, CorpUserInfoClass
+from datahub.metadata.schema_classes import (
+    CorpGroupInfoClass,
+    CorpUserEditableInfoClass,
+    CorpUserInfoClass,
+)
 
 from action_access_provisioner.config import DatabricksIdentityConfig
-from action_access_provisioner.identity import resolve_databricks_principal
+from action_access_provisioner.identity import (
+    resolve_databricks_group,
+    resolve_databricks_principal,
+)
 
 
 class FakeGraph:
@@ -72,3 +79,45 @@ def test_returns_none_when_unresolvable_and_lookup_disabled():
     graph = FakeGraph()
     assert resolve_databricks_principal(graph, "urn:li:corpuser:jsmith", cfg) is None
     assert graph.calls == 0
+
+
+def test_group_plain_name_passes_through():
+    """Forms that already collect the Databricks group name must keep working."""
+    graph = FakeGraph()
+    cfg = DatabricksIdentityConfig()
+    assert resolve_databricks_group(graph, "analytics_team", cfg) == "analytics_team"
+    assert graph.calls == 0
+
+
+def test_group_urn_resolves_to_display_name():
+    urn = "urn:li:corpGroup:analytics-team"
+    graph = FakeGraph(
+        {
+            (urn, CorpGroupInfoClass): CorpGroupInfoClass(
+                admins=[], members=[], groups=[], displayName="analytics_team"
+            )
+        }
+    )
+    assert resolve_databricks_group(graph, urn, DatabricksIdentityConfig()) == "analytics_team"
+
+
+def test_group_override_wins_over_lookup():
+    urn = "urn:li:corpGroup:analytics-team"
+    graph = FakeGraph(
+        {
+            (urn, CorpGroupInfoClass): CorpGroupInfoClass(
+                admins=[], members=[], groups=[], displayName="wrong"
+            )
+        }
+    )
+    cfg = DatabricksIdentityConfig(group_overrides={"analytics-team": "uc_analytics"})
+    assert resolve_databricks_group(graph, urn, cfg) == "uc_analytics"
+    assert graph.calls == 0
+
+
+def test_group_urn_falls_back_to_group_id():
+    """An unresolvable profile still yields a usable name rather than a URN."""
+    urn = "urn:li:corpGroup:analytics-team"
+    assert (
+        resolve_databricks_group(FakeGraph(), urn, DatabricksIdentityConfig()) == "analytics-team"
+    )

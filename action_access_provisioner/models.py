@@ -49,6 +49,9 @@ class FormFieldValues(BaseModel):
     databricks_group: str | None = None
     access_duration_days: int | None = None
     requestor_email: str | None = None
+    # Who the access is for, when that is not the person who raised the request
+    # (delegated requests, and service accounts that cannot raise their own).
+    requested_for: str | None = None
     justification: str | None = None
 
     # Raw field map in case callers want non-standard fields

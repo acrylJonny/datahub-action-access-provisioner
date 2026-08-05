@@ -33,7 +33,10 @@ from action_access_provisioner.graphql import (
     fetch_all_approved_requests,
     fetch_pending_action_requests,
 )
-from action_access_provisioner.identity import resolve_databricks_principal
+from action_access_provisioner.identity import (
+    resolve_databricks_group,
+    resolve_databricks_principal,
+)
 from action_access_provisioner.models import (
     ACTION_REQUEST_TYPE_WORKFLOW,
     LEDGER_STAGE_APPROVAL_NOTIFIED,
@@ -348,26 +351,33 @@ class DatabricksAccessProvisionerAction(Action):
     # ------------------------------------------------------------------
 
     def _provision(self, request: AccessRequest) -> None:
-        # The requestor's email is always the notification recipient; it is also the
-        # grantee unless the form requested a group (group-based access).
+        # The requestor's email is always the notification recipient. The beneficiary
+        # is who the access is actually for — the requestor, unless the form delegated
+        # it — and is the grantee unless a group was requested (group-based access).
         requestor_email = self._resolve_requestor_email(request)
+        beneficiary = self._resolve_beneficiary(request, requestor_email)
 
         ticketing = self.config.ticketing
         # 'replace' mode hands fulfilment to the ITSM tool, so no grant is issued.
         replace = ticketing is not None and ticketing.mode == TicketingMode.REPLACE
 
-        # Membership access model: add the requestor to the requested group rather
+        # A group picker on the form yields a corpGroup URN, which Unity Catalog would
+        # not recognise; resolve it to the Databricks group name before use.
+        group = resolve_databricks_group(
+            self.ctx.graph, request.form_fields.databricks_group, self.config.identity
+        )
+
+        # Membership access model: add the beneficiary to the requested group rather
         # than granting the object directly. Replace-mode ticketing still wins.
-        group = request.form_fields.databricks_group
         if (
             not replace
             and group
             and self.config.provisioning.group_access_mode == GroupAccessMode.MEMBERSHIP
         ):
-            self._provision_membership(request, requestor_email, group)
+            self._provision_membership(request, requestor_email, beneficiary, group)
             return
 
-        principal = self._resolve_grantee(request, requestor_email)
+        principal = self._resolve_grantee(group, beneficiary)
         # The grant target (catalog.schema.table) is derived from the dataset the
         # request was raised on — never from form fields — so it always matches the
         # entity and any platform_instance prefix is stripped (see the parser).
@@ -486,16 +496,20 @@ class DatabricksAccessProvisionerAction(Action):
         ) or dbx.is_membership_provisioned(conn, action_request_urn, self.config.state)
 
     def _provision_membership(
-        self, request: AccessRequest, requestor_email: str | None, group: str
+        self,
+        request: AccessRequest,
+        requestor_email: str | None,
+        beneficiary: str | None,
+        group: str,
     ) -> None:
-        if not requestor_email:
+        if not beneficiary:
             logger.error(
-                f"[Provision] Request {request.urn} has no requestor email — "
-                f"cannot add to group {group!r}; skipping"
+                f"[Provision] Request {request.urn} has no resolved beneficiary — "
+                f"cannot add anyone to group {group!r}; skipping"
             )
             return
         logger.info(
-            f"[Provision] membership: add {requestor_email} to group {group} "
+            f"[Provision] membership: add {beneficiary} to group {group} "
             f"for request {request.urn}"
         )
         conn = self._get_sql_conn()
@@ -503,16 +517,16 @@ class DatabricksAccessProvisionerAction(Action):
             dbx.add_group_member(
                 self._require_workspace_client(),
                 group,
-                requestor_email,
+                beneficiary,
                 dry_run=self.config.provisioning.dry_run,
             )
         except Exception as exc:
             logger.error(
-                f"[Provision] Failed to add {requestor_email} to group {group} "
+                f"[Provision] Failed to add {beneficiary} to group {group} "
                 f"for {request.urn}: {exc}",
                 exc_info=True,
             )
-            self._handle_membership_failure(conn, request, exc, requestor_email, group)
+            self._handle_membership_failure(conn, request, exc, beneficiary, group)
             return
 
         expires_at_ms: int | None = None
@@ -522,7 +536,7 @@ class DatabricksAccessProvisionerAction(Action):
             )
         membership = DatabricksGroupMembershipRecord(
             action_request_urn=request.urn,
-            user_email=requestor_email,
+            user_email=beneficiary,
             group_name=group,
             added_at_ms=int(time.time() * 1000),
             expires_at_ms=expires_at_ms,
@@ -532,15 +546,17 @@ class DatabricksAccessProvisionerAction(Action):
         except Exception as exc:
             logger.error(f"[Provision] Failed to record membership state for {request.urn}: {exc}")
 
-        self._mirror_membership_add(group, requestor_email)
+        self._mirror_membership_add(group, beneficiary)
 
         if dbx.claim_stage(conn, request.urn, LEDGER_STAGE_MEMBERSHIP_NOTIFIED, self.config.state):
             try:
                 send_dbx_membership_notification(
                     self.config.smtp,
                     request,
+                    # The requestor is told; on a delegated request they are not the
+                    # member being added.
                     recipient=requestor_email,
-                    member=requestor_email,
+                    member=beneficiary,
                     group=group,
                 )
             except Exception as exc:
@@ -758,21 +774,44 @@ class DatabricksAccessProvisionerAction(Action):
             "field_access_duration_days": self.config.field_access_duration_days,
             "field_justification": self.config.field_justification,
             "field_databricks_group": self.config.field_databricks_group,
+            "field_requested_for": self.config.field_requested_for,
         }
 
     def _resolve_requestor_email(self, request: AccessRequest) -> str | None:
-        """The requestor's Databricks principal (email) — the notification recipient,
-        and the grantee when no group is requested. Resolves via the identity config
-        (explicit override, email-form URN, or the DataHub corpuser profile)."""
+        """The requestor's Databricks principal (email) — the notification recipient.
+        Resolves via the identity config (explicit override, email-form URN, or the
+        DataHub corpuser profile)."""
         return resolve_databricks_principal(
             self.ctx.graph, request.requestor_urn, self.config.identity
         )
 
+    def _resolve_beneficiary(self, request: AccessRequest, requestor_email: str | None) -> str | None:
+        """The individual the access is for: whoever the form named, else the requestor.
+
+        A bare email is taken at face value — service accounts often have no DataHub
+        corpuser to resolve against.
+        """
+        requested_for = request.form_fields.requested_for
+        if not requested_for:
+            return requestor_email
+        if "@" in requested_for and not requested_for.startswith("urn:"):
+            return requested_for
+        beneficiary = resolve_databricks_principal(
+            self.ctx.graph, requested_for, self.config.identity
+        )
+        if not beneficiary:
+            logger.warning(
+                f"[Provision] Request {request.urn} names {requested_for!r} as the "
+                "beneficiary but it could not be resolved to a Databricks principal; "
+                "falling back to the requestor."
+            )
+        return beneficiary or requestor_email
+
     @staticmethod
-    def _resolve_grantee(request: AccessRequest, requestor_email: str | None) -> str | None:
+    def _resolve_grantee(group: str | None, beneficiary: str | None) -> str | None:
         """The Databricks principal the grant is applied to: an explicitly requested
-        group (group-based access) or, by default, the requestor's own identity."""
-        return request.form_fields.databricks_group or requestor_email
+        group (group-based access) or, by default, the individual it is for."""
+        return group or beneficiary
 
     def _get_sql_conn(self) -> Any:
         if self._sql_conn is None:

@@ -15,6 +15,7 @@ from action_access_provisioner.models import corpuser_email_from_urn
 logger = logging.getLogger(__name__)
 
 _CORPUSER_PREFIX = "urn:li:corpuser:"
+_CORPGROUP_PREFIX = "urn:li:corpGroup:"
 
 
 def _get_aspect(graph: object, entity_urn: str, aspect_type: type):
@@ -84,3 +85,52 @@ def resolve_databricks_principal(
         "recorded on the DataHub profile."
     )
     return None
+
+
+def _group_name_from_datahub(graph: object, group_urn: str) -> str | None:
+    """The group's display name from its DataHub corpGroup profile."""
+    from datahub.metadata.schema_classes import CorpGroupInfoClass
+
+    info = _get_aspect(graph, group_urn, CorpGroupInfoClass)
+    for attr in ("displayName", "name"):
+        value = getattr(info, attr, None) if info is not None else None
+        if value:
+            return str(value)
+    return None
+
+
+def resolve_databricks_group(
+    graph: object,
+    value: str | None,
+    config: DatabricksIdentityConfig,
+) -> str | None:
+    """Map a requested group to a Databricks group name.
+
+    Workflow forms usually pick a group with a DataHub group picker, which yields a
+    corpGroup URN rather than a name Unity Catalog would recognise. Anything that is
+    not such a URN is passed through untouched, so forms that already collect the
+    Databricks group name keep working.
+    """
+    if not value:
+        return None
+    if not value.startswith(_CORPGROUP_PREFIX):
+        return value
+
+    urn_id = value[len(_CORPGROUP_PREFIX) :]
+    overrides = config.group_overrides
+    for key in (value, urn_id):
+        if key in overrides:
+            return overrides[key]
+
+    if config.resolve_group_name_from_datahub:
+        name = _group_name_from_datahub(graph, value)
+        if name:
+            return name
+
+    # The URN id is the group's DataHub id, which for IdP-provisioned groups is
+    # usually the same string the IdP pushed into Databricks.
+    logger.info(
+        f"[Identity] No display name resolved for {value!r}; falling back to the "
+        f"group id {urn_id!r} as the Databricks group name."
+    )
+    return urn_id
